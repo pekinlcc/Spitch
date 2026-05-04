@@ -2,6 +2,37 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.7] — 2026-05-04
+
+修复 **WebSocket 冷连接 5 秒导致短句完全没反应**的问题。0.4.6 修了 server 给到的累积全文，但**冷启动时连不上 server**根本拿不到累积全文。
+
+### 真实抓到的现象（0.4.6 daemon log）
+
+```
+22:42:08,269  press: session started
+22:42:08,270  session: connecting to ASR endpoint
+22:42:13,379  session: connected, starting stream    ← 5.1 秒后才连上
+22:42:13,580  release  ← 用户已经松开了
+22:42:18,582  WARNING: no final transcript within 5.0s
+```
+
+冷启动 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel` 第一次连：DNS resolution + TCP handshake + TLS handshake + WS upgrade 全无 cache，**单次能花 5 秒+**。如果用户的 push-to-talk 时长比这个还短（说一句话通常 1-3 秒），按下时全在等连接，松开时连接刚好建立、audio 立刻 EOS，server 收到的几乎是空 audio + 立即关闭，于是什么 partial / final 都不返回。后续按下也时好时坏——connect < 1 秒能成功，> 2 秒就丢词。
+
+### 修复
+
+加 `_network_warmup_loop` 后台守护线程：
+
+- **daemon 启动时立即跑一次** `DoubaoClient.__aenter__()` + `__aexit__()` —— 把 DNS、TCP、TLS session ticket、WS upgrade 全部预热进 OS / Python 层 cache
+- **每 4 分钟重连一次**保持网络路径热乎；OS 在这个间隔内 DNS 不过期、TLS resumption ticket 仍然有效
+- 实测预热后 connect 时间从 5 秒级降到 < 500 ms，即使非常短的 push-to-talk 也能稳定收到 partial/final
+- 日志里能看到 `network warmup: 0.43s`，方便观察实际效果
+
+### 测试
+
+93 个单元测试全部通过；warmup 是 daemon 层逻辑，单元测试不需要联网就能跑。
+
+---
+
 ## [0.4.6] — 2026-05-04
 
 **真正修好了**长句中段被截断的问题。0.4.5 走的方向对（不要在第一段 final 时退 session）但实现错——以为 server 会在段切换点发出 `is_final=True` 让我们 append 到 `final_segments`。

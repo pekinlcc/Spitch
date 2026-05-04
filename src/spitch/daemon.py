@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from typing import Optional
 
 from .config import is_complete, is_verified, load_config
@@ -350,6 +351,18 @@ class SpitchDaemon:
                 log.warning(
                     "could not pre-open mic (%s) — will open on press", exc
                 )
+        # Warm up the WebSocket path to Doubao so the first press
+        # doesn't pay the cold DNS + TCP + TLS + WS-upgrade latency
+        # (we've measured 5+ seconds on the first connect after a
+        # fresh boot — long enough that a short utterance can finish
+        # before the connection is even established, leaving the daemon
+        # with nothing to inject). Periodic re-warm in a background
+        # thread keeps the network path hot during idle stretches.
+        threading.Thread(
+            target=self._network_warmup_loop,
+            name="spitch-warmup",
+            daemon=True,
+        ).start()
         log.info("Spitch daemon ready — hold %s to talk", "+".join(combo))
         _notify(
             "Spitch ready",
@@ -399,6 +412,57 @@ class SpitchDaemon:
         finally:
             self._shutdown()
         return 0
+
+    def _network_warmup_loop(self) -> None:
+        """Pre-establish (then close) a WebSocket to Doubao on a timer.
+
+        First connect after a cold boot can take 5+ seconds — DNS
+        resolution + TCP handshake + TLS handshake + WS upgrade, none
+        of which are cached. If the user's press happens during that
+        cold period, the audio capture sits in the session queue
+        waiting for the connection while the user already finishes
+        speaking and releases. The session ends with no transcript.
+
+        This loop opens a probe connection on daemon start and then
+        every 4 minutes — short enough that the OS keeps DNS in
+        cache and the TLS resumption ticket stays warm, long enough
+        that we're not hammering Doubao's auth endpoint.
+        """
+        import asyncio
+        d = self._cfg["doubao"]
+        creds = DoubaoCredentials(
+            app_key=d["app_key"],
+            access_key=d["access_key"],
+            resource_id=d.get("resource_id", "volc.bigasr.sauc.duration"),
+            endpoint=d.get(
+                "endpoint",
+                "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
+            ),
+        )
+
+        async def _one_probe() -> float:
+            t0 = time.time()
+            client = DoubaoClient(creds)
+            try:
+                await client.__aenter__()
+            finally:
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            return time.time() - t0
+
+        while True:
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    elapsed = loop.run_until_complete(_one_probe())
+                finally:
+                    loop.close()
+                log.info("network warmup: %.2fs", elapsed)
+            except Exception as exc:
+                log.warning("network warmup failed: %s", exc)
+            time.sleep(240.0)  # 4 min
 
     def _shutdown(self) -> None:
         """Clean shutdown: stop hotkey listener and close the mic.
