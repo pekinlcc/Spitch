@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spitch"
+version = "0.2.1"
+description = "Global-hotkey voice input for Linux desktops, powered by Doubao realtime ASR"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Spitch contributors"}]
+dependencies = [
+    "evdev>=1.6",
+    "websockets>=12.0,<16",
+]
+
+[project.optional-dependencies]
+# sounddevice is only one of two audio backends — the other is the
+# `arecord` CLI from alsa-utils, which ships preinstalled on stock
+# Ubuntu. Make it opt-in so a vanilla `pip install spitch` doesn't
+# pull a heavy native build (PortAudio + numpy) when arecord will do.
+audio-sd = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+]
+config-gtk = [
+    # Only needed for the GTK config dialog. The daemon itself does
+    # not depend on GI/GTK; spitch-config falls back to a CLI prompt
+    # when PyGObject is missing.
+    "PyGObject>=3.42",
+]
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+spitch = "spitch.__main__:main"
+spitch-config = "spitch.ui.config_dialog:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Ship the tray-state SVGs alongside the code so a pip install can
+# find them via importlib.resources / __file__-relative lookup.
+"spitch.tray" = ["icons/*.svg"]

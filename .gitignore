@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+.tox/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Internal review-tool / session data
+.cccplayer/
+
+# Local logs
+/tmp/spitch.log
