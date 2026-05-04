@@ -248,18 +248,32 @@ class VoiceController:
             async def _consume() -> bool:
                 """Drain events until cancel or end-of-stream. Return True iff a final fired.
 
-                Doubao marks each utterance segment ``definite=true`` as
-                soon as it's stable, even while the user is still
-                speaking the rest of the sentence. We must NOT exit on
-                the first such marker — instead we cache it as
-                "best final so far" and keep consuming. The session
-                ends naturally when the WebSocket stream closes (user
-                released the talk key, EOS frame went out, server
-                acknowledged), at which point we commit the most
-                recent definite text.
+                Doubao splits long utterances at sentence boundaries.
+                Each segment is independently marked ``definite=true``,
+                and CRUCIALLY, after that point ``evt.text`` *resets* —
+                the next event's ``text`` field contains only the new
+                utterance, not the accumulated full transcript. So a
+                naïve "use the last evt.text on EOS" loses every
+                segment except the last one (this manifested as
+                "the front of my sentence got cut off").
+
+                The fix is to accumulate finalized segments into a
+                list and append the running (non-finalized) utterance
+                at session end:
+
+                    full = "".join(final_segments) + current_utterance
+
+                Every callback (partial / latest_text / final) reports
+                this accumulated value so tray labels and inject text
+                stay consistent across segment boundaries.
                 """
-                last_final_text = ""
+                final_segments: list[str] = []
+                current_text = ""
                 saw_any_final = False
+
+                def full_text() -> str:
+                    return "".join(final_segments) + current_text
+
                 try:
                     while True:
                         try:
@@ -268,35 +282,32 @@ class VoiceController:
                             break
                         if self._cancel.is_set():
                             return False
-                        if evt.text:
-                            self._latest_text = evt.text
-                            if evt.is_final:
-                                # Remember it but stay in the loop —
-                                # more partials / finals may follow as
-                                # the user keeps talking.
-                                saw_any_final = True
-                                last_final_text = evt.text
-                                # Surface it as a partial too so the
-                                # tray label keeps updating across
-                                # the segment boundary; the actual
-                                # on_final fires once at EOS below.
-                                self._on_partial(evt.text)
-                            else:
-                                self._on_partial(evt.text)
-                    # Stream ended normally — commit the last definite
-                    # text we got. If we never saw a definite frame,
-                    # leave it to the FINALIZING-timeout fallback in
-                    # _session_coro to commit latest_text.
-                    if saw_any_final and last_final_text and not self._cancel.is_set():
-                        self._on_final(last_final_text)
+                        if not evt.text:
+                            continue
+                        if evt.is_final:
+                            # This utterance is now frozen — move it
+                            # to the segment list and reset the
+                            # running utterance for the next segment.
+                            saw_any_final = True
+                            final_segments.append(evt.text)
+                            current_text = ""
+                        else:
+                            current_text = evt.text
+                        # Keep latest_text + tray label aligned with
+                        # the cumulative full text, not the bare
+                        # current segment.
+                        self._latest_text = full_text()
+                        self._on_partial(self._latest_text)
+                    # Stream ended normally. Commit cumulative text
+                    # if we have anything to commit.
+                    commit = full_text()
+                    if commit and not self._cancel.is_set():
+                        self._on_final(commit)
                         return True
                     return False
                 except Exception:
                     if not self._cancel.is_set():
-                        # Prefer the last definite text over the bare
-                        # latest partial — definite frames have been
-                        # ITN-normalized + punctuated by the server.
-                        commit = last_final_text or self._latest_text
+                        commit = full_text() or self._latest_text
                         if commit:
                             self._on_final(commit)
                     raise

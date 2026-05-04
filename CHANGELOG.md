@@ -2,6 +2,37 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.5] — 2026-05-04
+
+修复**长句中带停顿时只 inject 最后一段**的核心 bug。0.4.1 的修复方向（不在第一个 `definite=true` 退 session）是对的，但实现有缺陷——以为 server 给的 `result.text` 是累积全文，实际是**每段 utterance 独立**的。
+
+### 真实抓到的现象（0.4.4 daemon log）
+
+```
+46,816 partial: …这个产品如果要做一些改进...你觉得有什么建议吗？尤其是那种对用户体验提升特别明显的
+46,853 partial: …尤其是那种对用户体验提升特别明显的    ← 前面"这个产品..."消失了！
+…
+final:   '尤其是那种对用户体验提升特别明显的，建议你按顺序给我排出来。'
+```
+
+豆包在多 utterance 模式下，第一段 `definite=true` 之后**下一段开始时 `result.text` 重置**——只包含当前正在生成的 utterance，不再包含之前 finalize 过的内容。
+
+### 修复
+
+`controller.py:_consume()` 改为段累积：
+
+- 收到 `is_final=True` → append 到 `final_segments` list、清空 `current_text`
+- 收到普通 partial → 覆盖 `current_text`
+- 始终把累积值 `"".join(final_segments) + current_text` 报给 `on_partial` / 写进 `latest_text` / 在 stream EOS 时作为 final commit
+
+这样 tray label 跨段不会"跳回"，inject 出来的也是从用户开始说到最后的完整文本。
+
+### 测试
+
+88 个单元测试全部通过；现有的 `test_voice_controller` mock client 在第一个 `is_final` 后就 `__aiter__` 自然结束，覆盖的恰好是 single-segment 路径，新累积逻辑对它行为不变。
+
+---
+
 ## [0.4.4] — 2026-05-04
 
 诊断日志补丁——把 press / release / session-connect / stream-start 的关键节点加进 `daemon.log`，遇到"按下没反应、partial 不出来"这种安静失败能精确定位是 hotkey 没收到、controller 没启动、ws 没连上、还是 server 没回 partial。
