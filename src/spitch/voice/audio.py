@@ -14,6 +14,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -106,13 +107,38 @@ class AudioCapture:
         if self.device:
             cmd += ["-D", self.device]
         try:
+            # Capture stderr (not DEVNULL) so we can surface the real
+            # reason if arecord exits immediately — e.g. "device or
+            # resource busy", "audio open error: No such file or
+            # directory". Without this, the daemon would silently
+            # record nothing for ``final_wait_seconds`` then warn
+            # "no final transcript" with no diagnostic.
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         except FileNotFoundError:
             return False
+
+        # Give arecord a moment to actually open the capture device.
+        # If it bails out (busy device, missing PCM, ALSA misconfig),
+        # raise immediately with the stderr text so the user gets a
+        # real error notification instead of a 5-second silent timeout.
+        time.sleep(0.05)
+        if self._proc.poll() is not None:
+            err_bytes = b""
+            try:
+                if self._proc.stderr is not None:
+                    err_bytes = self._proc.stderr.read() or b""
+            except Exception:
+                pass
+            self._proc = None
+            err_text = err_bytes.decode("utf-8", errors="replace").strip()
+            raise AudioCaptureError(
+                "arecord exited immediately: "
+                + (err_text or "no stderr output")
+            )
 
         def _reader_loop() -> None:
             assert self._proc is not None and self._proc.stdout is not None

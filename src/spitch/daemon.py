@@ -67,6 +67,12 @@ class SpitchDaemon:
         # from shared-mutable globals so a fast re-press can't blank out
         # the previous session's final text before the inject thread reads it.
         self._pending_final: Optional["queue.Queue[str]"] = None
+        # Set when a press() was accepted by the voice controller. Used
+        # by _on_release to decide whether to start an inject thread,
+        # *without* re-checking voice.state — the controller can already
+        # have transitioned back to IDLE if Doubao sent a definite=true
+        # frame before the user physically released the modifiers.
+        self._press_accepted = False
         self._listener: Optional[HotkeyListener] = None
         self._voice: Optional[VoiceController] = None
         self._indicator = None  # set in run() if the typelib is present
@@ -150,16 +156,25 @@ class SpitchDaemon:
             log.info("press: voice not idle (state=%s)", self._voice.state)
             return
         self._pending_final = new_pending
+        self._press_accepted = True
 
     def _on_release(self) -> None:
         if self._voice is None:
             return
-        if self._voice.state != State.RECORDING:
+        # Don't gate on voice.state — Doubao may have already sent a
+        # definite=true frame while the user was still holding the keys,
+        # which transitions the controller back to IDLE. We still need
+        # to inject the text in that case. The _press_accepted flag is
+        # the source of truth for "this release pairs with an accepted
+        # press of OUR session".
+        if not self._press_accepted:
             return
+        self._press_accepted = False
         # Capture the queue BEFORE release() — by the time the inject
         # thread runs, a fast next-press may have replaced
         # self._pending_final with a fresh queue.
         pending = self._pending_final
+        self._pending_final = None
         self._voice.release()
         threading.Thread(
             target=self._finalize_and_inject,
@@ -172,6 +187,13 @@ class SpitchDaemon:
         if self._voice is None:
             return
         self._voice.cancel()
+        # Drop the queue and the accepted-press flag so the eventual
+        # _on_release (the user is still holding the modifiers when
+        # cancel fires) does not start an inject thread that would
+        # block on an empty queue and surface a misleading
+        # "no final transcript" warning 5 seconds later.
+        self._press_accepted = False
+        self._pending_final = None
         log.info("cancelled (third key during chord)")
 
     # -- finalize+inject ----------------------------------------------
@@ -192,14 +214,21 @@ class SpitchDaemon:
             if self._listener and self._listener.is_quiescent():
                 break
             time.sleep(0.02)
-        keystroke = (self._cfg.get("inject") or {}).get(
-            "paste_keystroke", "Ctrl+Shift+V"
-        )
+        inject_cfg = self._cfg.get("inject") or {}
+        keystroke = inject_cfg.get("paste_keystroke", "Ctrl+Shift+V")
+        try:
+            restore_delay_ms = int(inject_cfg.get("restore_clipboard_delay_ms", 300))
+        except (TypeError, ValueError):
+            restore_delay_ms = 300
         # Hold the lock across the whole clipboard write + keystroke +
         # restore so a second inject thread can't slip in between, copy
         # its text, and have us paste it for them.
         with self._inject_lock:
-            ok, reason = inject_text(text, paste_keystroke=keystroke)
+            ok, reason = inject_text(
+                text,
+                paste_keystroke=keystroke,
+                restore_delay_ms=restore_delay_ms,
+            )
         if not ok:
             _notify("Spitch — inject failed", reason or "unknown error")
 

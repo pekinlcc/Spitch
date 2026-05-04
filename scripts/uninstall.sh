@@ -22,9 +22,12 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl --user disable --now spitch.service 2>/dev/null || true
 fi
 
-# Stop any running daemon process.
-if pgrep -f "python3? -m spitch( |$|--)" >/dev/null 2>&1; then
-    pkill -f "python3? -m spitch( |$|--)" || true
+# Stop any running daemon process. Use a literal substring rather than
+# a regex with optional groups — pgrep on Linux uses BRE where ``?`` and
+# ``( |$|--)`` are not metacharacters, so the previous pattern matched
+# nothing and uninstall left the daemon running.
+if pgrep -f -- "-m spitch" >/dev/null 2>&1; then
+    pkill -f -- "-m spitch" || true
     echo "spitch-uninstall: stopped running daemon"
     removed_any=1
 fi

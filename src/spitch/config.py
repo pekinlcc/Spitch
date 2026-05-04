@@ -45,6 +45,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # you primarily voice-type into VSCode-on-markdown (where
         # Ctrl+Shift+V is bound to "Open Preview").
         "paste_keystroke": "Ctrl+Shift+V",
+        # How long to wait after sending the paste keystroke before
+        # restoring the user's prior clipboard contents. Slow Electron
+        # apps (Feishu, Slack on a busy machine) can take 500–800 ms to
+        # actually consume the paste; if we restore too early they
+        # paste the OLD clipboard instead. Bump this if you see paste
+        # land as the previously-copied text.
+        "restore_clipboard_delay_ms": 300,
     },
     "verified_at": None,
     "verified_signature": None,
