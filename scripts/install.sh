@@ -32,11 +32,20 @@ sys.exit(0 if sys.version_info >= (3, 10) else 1)
 PY
 
 missing=()
-command -v wl-copy >/dev/null 2>&1 || missing+=("wl-clipboard (provides wl-copy)")
+# A clipboard helper is required, but Wayland and X11 use different
+# tools. Any one of wl-copy / xclip / xsel covers us; only complain
+# when none of them is present.
+if ! command -v wl-copy >/dev/null 2>&1 \
+   && ! command -v xclip   >/dev/null 2>&1 \
+   && ! command -v xsel    >/dev/null 2>&1; then
+    missing+=("a clipboard helper (wl-clipboard for Wayland, or xclip/xsel for X11)")
+fi
 "$PYTHON" -c "import evdev" 2>/dev/null || missing+=("python3-evdev")
 if [ "${#missing[@]}" -gt 0 ]; then
-    info "missing system packages — install with:"
-    info "  sudo apt-get install -y python3-evdev wl-clipboard"
+    info "missing system packages:"
+    for m in "${missing[@]}"; do info "  - $m"; done
+    info "install with (Wayland):  sudo apt-get install -y python3-evdev wl-clipboard"
+    info "or (X11):                sudo apt-get install -y python3-evdev xclip"
     info "(then re-run this script)"
 fi
 

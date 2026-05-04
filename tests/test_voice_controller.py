@@ -136,6 +136,101 @@ class VoiceControllerTests(unittest.TestCase):
                         self._wait_state(ctrl, State.ERROR, timeout=0.1))
         self.assertEqual(finals, [])
 
+    def test_final_during_recording_commits_and_returns_to_idle(self):
+        """Server sends definite=true while the user is still holding the keys.
+
+        Regression: previously the controller went straight to IDLE
+        without firing any event the daemon could distinguish from a
+        cancel, and the daemon's _on_release dropped the transcript on
+        the floor because it gated on state == RECORDING. We assert
+        on_final is delivered exactly once and that the controller
+        ends up IDLE without an explicit release().
+        """
+
+        class EagerClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                # Don't drain audio fully — emit a final immediately.
+                # Simulates Doubao deciding the utterance is complete
+                # while the user still has the key pressed.
+                yield TranscriptEvent("早", False, {})
+                yield TranscriptEvent("早安。", True, {})
+
+        finals: list[str] = []
+        ctrl = VoiceController(
+            client_factory=lambda: EagerClient(),
+            audio=FakeAudio([b"\x00" * 320] * 10),
+            on_final=finals.append,
+        )
+        self.assertTrue(ctrl.press())
+        self.assertTrue(self._wait_state(ctrl, State.IDLE, timeout=3.0))
+        self.assertEqual(finals, ["早安。"])
+
+    def test_state_transition_runs_after_audio_stop_on_error(self):
+        """ERROR is published only after the failed session's audio.stop()
+        has run.
+
+        Regression for the race where _set_state(ERROR) ran BEFORE the
+        outer-finally cleanup, so a re-press observing ERROR could call
+        audio.start() while the dying session was still in flight and
+        about to call audio.stop() on the *new* stream.
+        """
+
+        state_at_stop: list[State] = []
+        stop_done = threading.Event()
+
+        class TracingFakeAudio:
+            def start(self) -> str:
+                return "fake"
+
+            def stop(self) -> None:
+                # Record the controller's published state at the moment
+                # the dying session calls audio.stop() in its outer
+                # finally. With the bug, state has already flipped to
+                # ERROR (so a re-press observing ERROR could call
+                # audio.start() and have us stomp on it). With the
+                # fix, state is still RECORDING here — the transition
+                # to ERROR happens strictly after we return.
+                state_at_stop.append(ctrl.state)
+                stop_done.set()
+
+            def chunks(self):
+                if False:
+                    yield b""  # pragma: no cover
+
+        class FailingOpenClient:
+            async def __aenter__(self):
+                raise RuntimeError("simulated connect failure")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                if False:
+                    yield  # pragma: no cover
+
+        audio = TracingFakeAudio()
+        errors: list[BaseException] = []
+        ctrl = VoiceController(
+            client_factory=lambda: FailingOpenClient(),
+            audio=audio,
+            on_error=errors.append,
+        )
+        self.assertTrue(ctrl.press())
+        self.assertTrue(self._wait_state(ctrl, State.ERROR, timeout=3.0))
+        self.assertTrue(stop_done.is_set())
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(
+            state_at_stop, [State.RECORDING],
+            "audio.stop() should run while state is still RECORDING — "
+            "ERROR must only be published after cleanup completes",
+        )
+
     def test_finalize_timeout_commits_latest_partial(self):
         """Server sends partials then never returns a definite=true frame.
 

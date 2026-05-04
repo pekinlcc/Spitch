@@ -2,6 +2,48 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] — 2026-05-04
+
+修复了**前半截语音被吃掉**这个长期问题，并把第二轮代码审查（含一次自审）发现的 P0/P1 全部修完。配置文件层面**完全向后兼容**——新增字段都有默认值，老配置文件加载后自动获得它们；CLI 命令不变。
+
+### 新增
+
+- **常驻麦克风 + 环形预缓冲**（修首字丢失）：daemon 启动后立刻打开麦克风并把 PCM 持续灌入 500 ms 的环形缓冲；按下 `Ctrl+Alt` 时先把这段缓冲推进会话队列，再继续推新数据。原本 PortAudio/ALSA 启动期 50–500 ms 的"麦克风没在录音但用户已经在说"那段话不再丢
+- **`audio.prebuffer_ms`**：新配置项，默认 500。设为 0 退回旧的"按下才开麦"行为，对常驻麦克风有顾虑的用户可以这样关
+- **`inject.restore_clipboard_delay_ms`**：粘贴后恢复用户原剪贴板的延迟，默认 300 ms。飞书/微信等慢 Electron 应用之前需要改源码里的 `time.sleep(0.3)`，现在改配置就行
+- **`HotkeyListener.wait_quiescent()`**：事件驱动的"等所有修饰键松开"，替代原本 50 Hz 的 busy-poll；空闲 CPU 从 50 唤醒/秒降到 0
+- **arecord 启动失败立即报错**：捕获 stderr，启动后 50 ms 内 arecord 已退出（设备占用、PCM 不存在、ALSA 配错）就直接抛 `AudioCaptureError` 弹通知，而不是傻等 5 秒"no final transcript"
+
+### 修复
+
+- **RECORDING 期间收到 `definite=true` 导致整段丢词**：豆包对短句、停顿够长的句子会在用户还没松键时就发 final，控制器随即转 IDLE，旧 daemon 的 `_on_release` 因为 `state != RECORDING` 直接 return，转写被丢。改用 `_press_accepted` 标记取代 state 比较
+- **ERROR 路径上新旧 session 互相踩 mic**：错误后立刻重按 → 新 session 调 `audio.start()` 重开麦 → 旧 session `finally` 里的 `audio.stop()` 把**新会话**的 stream 关了，新录音瞬间断流。控制器把状态转换严格放到 `audio.stop()` **之后**
+- **uninstall 杀不掉 daemon**：`pgrep -f "python3? -m spitch( |$|--)"` 在 BRE 下一个进程也匹配不到。改成字面量 `-m spitch`
+- **UInput 创建后第一批事件被吞**：udev/libinput 加 seat 需要 10–50 ms，原代码立刻就发 EV_KEY，部分机器上首次粘贴看似"完全没反应"。`UInput()` 之后加 30 ms settle
+- **install.sh 在 X11 上误报**：装了 xclip 仍提示"missing wl-clipboard"。改为接受 wl-copy / xclip / xsel 三选一
+
+### 加固
+
+- **arecord stderr 64 KB 管道阻塞风险**：早退检查通过后启 daemon 线程持续 drain stderr，避免长录音里 arecord 写 stderr 卡住反过来饿死 stdout
+- **UInput 上的 settle sleep 资源安全**：移到 `try/finally` 之内，信号打断不会泄露虚拟键盘
+- **拒绝单 modifier 热键**：`HotkeyListener.__init__` 和 `daemon.run()` 双重把关，配 `Ctrl` 之类只会让 daemon 起来后乱触发，直接拒绝并给修复提示
+- **`_detect_backend` 一次 inject 只调一次**：原本 `_paste`、`_copy`、还原 `_copy` 各调一次（每次 `shutil.which` 都是 PATH 遍历），改为入口检测一次传下去
+
+### 测试
+
+75 个单元测试，13 个新增，全部通过。覆盖：
+
+- 控制器 ERROR 路径 audio race（断言 `audio.stop()` 时刻状态仍是 RECORDING）
+- daemon `_on_press / _on_release / _on_cancel / _on_final` 完整生命周期，包括 RECORDING-final 与 FINALIZING-window 两种时序
+- HotkeyListener 构造校验、`parse_combo`、`wait_quiescent` 的 ~30 ms 唤醒延迟
+- 预缓冲 replay、容量、跨会话独立、`close()` 清空、`start()` 与 callback 并发竞态
+
+### 打包
+
+- 0.3.0 sdist + wheel 上传到 GitHub release，`pip install spitch==0.3.0` 可以直接装
+
+---
+
 ## [0.2.1] — 2026-05-04
 
 第一轮代码审查后的修复 + 健壮性强化版。**用户层面没有破坏性变更**，配置文件和 CLI 命令完全兼容 0.2.0；建议所有用户升级。
@@ -58,5 +100,6 @@
 - libayatana-appindicator 系统托盘
 - 配置原子写 + chmod 600 + 凭据指纹 verified gating
 
+[0.3.0]: https://github.com/pekinlcc/Spitch/releases/tag/v0.3.0
 [0.2.1]: https://github.com/pekinlcc/Spitch/releases/tag/v0.2.1
 [0.2.0]: https://github.com/pekinlcc/Spitch/releases/tag/v0.2.0

@@ -33,6 +33,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "audio": {
         "device": None,
         "sample_rate": 16000,
+        # Continuous-capture pre-buffer length in ms. The mic is opened
+        # at daemon start and audio fills a ring of this many ms; on
+        # press we replay the ring into the session so the first words
+        # are not lost to mic-startup latency (PortAudio + ALSA combine
+        # for a 50–500 ms gap before PCM actually flows). 500 ms is
+        # safe across desktops. Set to 0 to fall back to the legacy
+        # "open mic on press, close on release" behavior — gives back
+        # the always-on-mic but loses the head of every utterance.
+        "prebuffer_ms": 500,
     },
     "hotkey": {
         "talk_key": "Ctrl+Alt",
@@ -45,6 +54,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # you primarily voice-type into VSCode-on-markdown (where
         # Ctrl+Shift+V is bound to "Open Preview").
         "paste_keystroke": "Ctrl+Shift+V",
+        # How long to wait after sending the paste keystroke before
+        # restoring the user's prior clipboard contents. Slow Electron
+        # apps (Feishu, Slack on a busy machine) can take 500–800 ms to
+        # actually consume the paste; if we restore too early they
+        # paste the OLD clipboard instead. Bump this if you see paste
+        # land as the previously-copied text.
+        "restore_clipboard_delay_ms": 300,
     },
     "verified_at": None,
     "verified_signature": None,

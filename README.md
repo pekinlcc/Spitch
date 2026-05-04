@@ -72,8 +72,10 @@ spitch-daemon &      # 按住 Ctrl+Alt 说话，松开后自动粘贴
 | `doubao.access_key` | 火山引擎 BigASR 的 Access Token | — |
 | `doubao.endpoint` | WebSocket 接入点 | `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel` |
 | `audio.sample_rate` | 麦克风采样率 | 16000 |
+| `audio.prebuffer_ms` | 常驻麦克风的环形预缓冲长度（ms）。修复"按下后说的前半截被吃掉"——按下时回放这段缓冲。设为 0 = 关闭常驻麦克风，按下才开 | `500` |
 | `hotkey.talk_key` | 按住说话的修饰键组合 | `Ctrl+Alt` |
 | `inject.paste_keystroke` | 粘贴用的合成快捷键 | `Ctrl+Shift+V` |
+| `inject.restore_clipboard_delay_ms` | 粘贴后等多久才把剪贴板还原（ms） | `300` |
 | `inject.final_wait_seconds` | 等 server 出 final 的最长秒数 | `5.0` |
 
 修改后重启 daemon 生效。

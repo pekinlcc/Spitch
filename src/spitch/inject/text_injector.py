@@ -67,8 +67,9 @@ def _detect_backend() -> Optional[str]:
     return None
 
 
-def _copy(data: bytes) -> Tuple[bool, str]:
-    backend = _detect_backend()
+def _copy(data: bytes, backend: Optional[str] = None) -> Tuple[bool, str]:
+    if backend is None:
+        backend = _detect_backend()
     if backend is None:
         msg = "no clipboard helper found — install wl-clipboard (Wayland) or xclip/xsel (X11)"
         log.error(msg)
@@ -88,12 +89,13 @@ def _copy(data: bytes) -> Tuple[bool, str]:
         return False, msg
 
 
-def _paste() -> Optional[bytes]:
+def _paste(backend: Optional[str] = None) -> Optional[bytes]:
     """Read the current clipboard. Returns ``None`` if no helper is
     available or the call fails. Preserves trailing newlines so a
     save+restore round trip is byte-identical.
     """
-    backend = _detect_backend()
+    if backend is None:
+        backend = _detect_backend()
     if backend == "wayland":
         if not shutil.which("wl-paste"):
             return None
@@ -187,6 +189,14 @@ def _send_paste_keystroke(spec: str = "Ctrl+Shift+V") -> Tuple[bool, str]:
         log.error(msg)
         return False, msg
     try:
+        # Wait for udev → libinput → compositor to enumerate the new
+        # virtual keyboard into the seat. Without this delay the first
+        # few EV_KEY events can be dropped on fast machines and the
+        # paste silently does nothing — only a retry recovers. 30 ms
+        # is enough in practice on GNOME/KDE Wayland and X11. Kept
+        # inside the try so the finally always closes the device,
+        # even if a signal interrupts the sleep.
+        time.sleep(0.03)
         # Press modifiers, then main key, with small inter-event waits
         # so the compositor sees a clean chord rather than simultaneous
         # events that some focused apps drop.
@@ -222,6 +232,7 @@ def inject_text(
     *,
     paste_keystroke: str = "Ctrl+Shift+V",
     restore_clipboard: bool = True,
+    restore_delay_ms: int = 300,
 ) -> Tuple[bool, str]:
     """Paste ``text`` into the focused app.
 
@@ -229,13 +240,16 @@ def inject_text(
       1. Save current clipboard (if ``restore_clipboard``).
       2. Write ``text`` to clipboard.
       3. Send the configured paste keystroke via uinput.
-      4. After ~0.3s, restore the saved clipboard so we don't surprise
-         the user with stale content next time they paste manually.
-         The restore runs in ``finally`` so it also fires on failure
-         paths after the clipboard was overwritten.
+      4. After ``restore_delay_ms`` milliseconds, restore the saved
+         clipboard so we don't surprise the user with stale content
+         next time they paste manually. The restore runs in
+         ``finally`` so it also fires on failure paths after the
+         clipboard was overwritten.
 
     ``paste_keystroke`` defaults to ``Ctrl+Shift+V`` — works in terminals
     (where Ctrl+V is literal-quote), browsers, Slack, Feishu, etc.
+    ``restore_delay_ms`` defaults to 300 ms; bump it to 600–800 ms if
+    your target Electron app is slow to consume the paste.
 
     Returns ``(ok, reason)``. ``reason`` is empty on success and a
     short human-readable string on failure (so the daemon can surface
@@ -244,10 +258,19 @@ def inject_text(
     """
     if not text:
         return True, ""
-    saved = _paste() if restore_clipboard else None
+    # Detect once per inject. The previous implementation called
+    # _detect_backend() in each of _paste, _copy, and the restore _copy
+    # — three full PATH walks (shutil.which) for every transcript. The
+    # backend cannot change inside a single inject call, so cache it.
+    backend = _detect_backend()
+    if backend is None:
+        msg = "no clipboard helper found — install wl-clipboard (Wayland) or xclip/xsel (X11)"
+        log.error(msg)
+        return False, msg
+    saved = _paste(backend) if restore_clipboard else None
     clipboard_was_overwritten = False
     try:
-        ok, reason = _copy(text.encode("utf-8"))
+        ok, reason = _copy(text.encode("utf-8"), backend)
         if not ok:
             return False, reason
         clipboard_was_overwritten = True
@@ -261,8 +284,8 @@ def inject_text(
             # before we overwrite the clipboard with the saved bytes.
             # Runs even on the failure path so the user gets their
             # original clipboard back if our paste failed mid-way.
-            time.sleep(0.3)
+            time.sleep(max(0.0, restore_delay_ms / 1000.0))
             try:
-                _copy(saved)
+                _copy(saved, backend)
             except Exception:
                 pass

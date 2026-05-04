@@ -21,7 +21,6 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 from typing import Optional
 
 from .config import is_complete, is_verified, load_config
@@ -62,11 +61,22 @@ def _notify(summary: str, body: str = "") -> None:
 class SpitchDaemon:
     def __init__(self, cfg: dict):
         self._cfg = cfg
+        # Audio capture lives across sessions in continuous-capture
+        # mode; daemon owns its lifecycle (open at run() start, close
+        # at shutdown). Stored here so run() can call open()/close()
+        # on the same instance the controller is using.
+        self._audio: Optional[AudioCapture] = None
         # Per-press queue: created in _on_press, captured by _on_release
         # before the next press can replace it. Decouples session state
         # from shared-mutable globals so a fast re-press can't blank out
         # the previous session's final text before the inject thread reads it.
         self._pending_final: Optional["queue.Queue[str]"] = None
+        # Set when a press() was accepted by the voice controller. Used
+        # by _on_release to decide whether to start an inject thread,
+        # *without* re-checking voice.state — the controller can already
+        # have transitioned back to IDLE if Doubao sent a definite=true
+        # frame before the user physically released the modifiers.
+        self._press_accepted = False
         self._listener: Optional[HotkeyListener] = None
         self._voice: Optional[VoiceController] = None
         self._indicator = None  # set in run() if the typelib is present
@@ -92,11 +102,18 @@ class SpitchDaemon:
                 "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
             ),
         )
-        sample_rate = (self._cfg.get("audio") or {}).get("sample_rate", 16000)
-        audio = AudioCapture(AudioConfig(sample_rate=sample_rate))
+        audio_cfg = self._cfg.get("audio") or {}
+        sample_rate = audio_cfg.get("sample_rate", 16000)
+        try:
+            prebuffer_ms = int(audio_cfg.get("prebuffer_ms", 500))
+        except (TypeError, ValueError):
+            prebuffer_ms = 500
+        self._audio = AudioCapture(
+            AudioConfig(sample_rate=sample_rate, prebuffer_ms=prebuffer_ms)
+        )
         return VoiceController(
             client_factory=lambda: DoubaoClient(creds, sample_rate=sample_rate),
-            audio=audio,
+            audio=self._audio,
             on_partial=self._on_partial,
             on_final=self._on_final,
             on_error=self._on_error,
@@ -150,15 +167,28 @@ class SpitchDaemon:
             log.info("press: voice not idle (state=%s)", self._voice.state)
             return
         self._pending_final = new_pending
+        self._press_accepted = True
 
     def _on_release(self) -> None:
         if self._voice is None:
             return
-        if self._voice.state != State.RECORDING:
+        # Don't gate on voice.state — Doubao may have already sent a
+        # definite=true frame while the user was still holding the keys,
+        # which transitions the controller back to IDLE. We still need
+        # to inject the text in that case. The _press_accepted flag is
+        # the source of truth for "this release pairs with an accepted
+        # press of OUR session".
+        if not self._press_accepted:
             return
-        # Capture the queue BEFORE release() — by the time the inject
-        # thread runs, a fast next-press may have replaced
-        # self._pending_final with a fresh queue.
+        self._press_accepted = False
+        # Capture the queue locally so a later, fast next-press that
+        # replaces self._pending_final with Q2 cannot redirect *our*
+        # inject thread to the wrong queue. Do NOT clear
+        # self._pending_final here — the worker may still be in
+        # FINALIZING and on_final fires by reading self._pending_final;
+        # if we'd nulled it the slow-final path would silently drop
+        # the transcript. The next accepted press is the only thing
+        # that legitimately replaces it.
         pending = self._pending_final
         self._voice.release()
         threading.Thread(
@@ -172,6 +202,13 @@ class SpitchDaemon:
         if self._voice is None:
             return
         self._voice.cancel()
+        # Drop the queue and the accepted-press flag so the eventual
+        # _on_release (the user is still holding the modifiers when
+        # cancel fires) does not start an inject thread that would
+        # block on an empty queue and surface a misleading
+        # "no final transcript" warning 5 seconds later.
+        self._press_accepted = False
+        self._pending_final = None
         log.info("cancelled (third key during chord)")
 
     # -- finalize+inject ----------------------------------------------
@@ -187,19 +224,26 @@ class SpitchDaemon:
         # Wait for the user to physically release all hotkey modifiers
         # before we synthesize Ctrl+V — otherwise the still-held Alt
         # would turn our paste into Ctrl+Alt+V (a different shortcut).
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            if self._listener and self._listener.is_quiescent():
-                break
-            time.sleep(0.02)
-        keystroke = (self._cfg.get("inject") or {}).get(
-            "paste_keystroke", "Ctrl+Shift+V"
-        )
+        # The listener exposes an Event that flips on the release of
+        # the last modifier; blocking on it idle-burns 0% CPU between
+        # presses (the previous busy-poll spent 50 wakeups/s here).
+        if self._listener is not None:
+            self._listener.wait_quiescent(timeout=2.0)
+        inject_cfg = self._cfg.get("inject") or {}
+        keystroke = inject_cfg.get("paste_keystroke", "Ctrl+Shift+V")
+        try:
+            restore_delay_ms = int(inject_cfg.get("restore_clipboard_delay_ms", 300))
+        except (TypeError, ValueError):
+            restore_delay_ms = 300
         # Hold the lock across the whole clipboard write + keystroke +
         # restore so a second inject thread can't slip in between, copy
         # its text, and have us paste it for them.
         with self._inject_lock:
-            ok, reason = inject_text(text, paste_keystroke=keystroke)
+            ok, reason = inject_text(
+                text,
+                paste_keystroke=keystroke,
+                restore_delay_ms=restore_delay_ms,
+            )
         if not ok:
             _notify("Spitch — inject failed", reason or "unknown error")
 
@@ -230,6 +274,19 @@ class SpitchDaemon:
                 file=sys.stderr,
             )
             return 2
+        if len(combo) < 2:
+            # Single-modifier hold is unusable: Ctrl/Alt/Shift/Super get
+            # pressed dozens of times per minute for system shortcuts
+            # and would each trigger a recording. Reject with a
+            # specific, fixable message rather than letting the daemon
+            # come up and behave erratically.
+            print(
+                f"spitch: hotkey.talk_key must combine two modifiers "
+                f"(got just '{combo[0]}'). Try 'Ctrl+Alt' or "
+                "'Ctrl+Shift'.",
+                file=sys.stderr,
+            )
+            return 2
         self._listener = HotkeyListener(
             combo,
             on_press=self._on_press,
@@ -241,6 +298,24 @@ class SpitchDaemon:
         except RuntimeError as exc:
             print(f"spitch: {exc}", file=sys.stderr)
             return 3
+        # Pre-open the mic so the very first press doesn't pay the
+        # 50–500 ms backend warm-up latency that otherwise eats the
+        # head of the user's first utterance. With prebuffer_ms == 0
+        # this is a no-op and we fall back to open-on-press.
+        if self._audio is not None:
+            try:
+                backend = self._audio.open()
+                if backend:
+                    log.info("audio backend warmed up: %s", backend)
+            except Exception as exc:
+                # If continuous capture failed (busy device, missing
+                # backend), don't kill the daemon — fall back to
+                # open-on-press by leaving the mic closed. The first
+                # press's audio.start() will retry and surface a real
+                # error to the user via the controller.
+                log.warning(
+                    "could not pre-open mic (%s) — will open on press", exc
+                )
         log.info("Spitch daemon ready — hold %s to talk", "+".join(combo))
         _notify(
             "Spitch ready",
@@ -279,8 +354,7 @@ class SpitchDaemon:
             try:
                 Gtk.main()
             finally:
-                if self._listener:
-                    self._listener.stop()
+                self._shutdown()
             return 0
 
         stop = threading.Event()
@@ -289,9 +363,26 @@ class SpitchDaemon:
         try:
             stop.wait()
         finally:
-            if self._listener:
-                self._listener.stop()
+            self._shutdown()
         return 0
+
+    def _shutdown(self) -> None:
+        """Clean shutdown: stop hotkey listener and close the mic.
+
+        Called from both the GTK and headless main loops on exit. The
+        mic close releases the ALSA / PortAudio handle so a re-launch
+        of the daemon doesn't hit "device busy" on the same hardware.
+        """
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+        if self._audio is not None:
+            try:
+                self._audio.close()
+            except Exception:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -191,7 +191,6 @@ class VoiceController:
                 # apart from a websockets-library bug.
                 wrapped = type(exc).__name__ + ": " + (str(exc) or repr(exc))
                 self._on_error(RuntimeError(wrapped))
-                self._set_state(State.ERROR)
             finally:
                 # Drain async-generator finalizers (the Doubao stream
                 # and the audio _async_chunks generator) before tearing
@@ -212,9 +211,11 @@ class VoiceController:
                 self._audio.stop()
             except Exception:
                 pass
-        if not errored:
-            # session ended cleanly — back to idle
-            self._set_state(State.IDLE)
+            # Publish the new state AFTER audio.stop. If we set ERROR /
+            # IDLE first, a press() observing the new state could call
+            # self._audio.start() and open a fresh stream — then our
+            # stop() above would tear down the *new* session's mic.
+            self._set_state(State.ERROR if errored else State.IDLE)
 
     async def _session_coro(self) -> None:
         client = self._client_factory()
