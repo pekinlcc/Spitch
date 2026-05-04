@@ -142,5 +142,46 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(sent_audio, b"".join(chunks))
 
 
+    def test_stream_reconciles_when_server_drops_finalized_utterances(self):
+        """Doubao 在多 utterance 场景下会随时把已 finalize 的段从 utterances[]
+        里移除——下一帧 evt.text 比上一帧短。stream() 必须自己累积，让 caller
+        看到的 text 永远单调增长（不会少掉前半句）。
+
+        本测试用真实从 daemon.log 抓到的过渡序列 (省略号是为了简短) 模拟。
+        """
+        scripted = [
+            # frame 1: "好的, A" 还在生成 utterance 1
+            _server_response({"result": {"text": "好的, A", "utterances": [
+                {"text": "好的, A", "definite": False},
+            ]}}),
+            # frame 2: utterance 1 finalize, server 仍在数组里, 加上 utterance 2 开始
+            _server_response({"result": {"text": "B", "utterances": [
+                {"text": "好的, A.", "definite": True},
+                {"text": "B", "definite": False},
+            ]}}),
+            # frame 3: server 把 utterance 1 从数组里 DROP — 只剩 utterance 2
+            _server_response({"result": {"text": "B 继续", "utterances": [
+                {"text": "B 继续", "definite": False},
+            ]}}),
+            # frame 4: utterance 2 也 finalize, server 已经 drop 了 utterance 1
+            _server_response({"result": {"text": "B 继续完了。", "utterances": [
+                {"text": "B 继续完了。", "definite": True},
+            ]}}),
+        ]
+        chunks = [b"\x00" * 320]
+        events, _sent = self._stream_session(scripted, chunks)
+        # Each evt.text must be a (non-strict) prefix-extension of the last —
+        # never shrink. Final text must contain *both* finalized utterances.
+        texts = [e.text for e in events]
+        for i in range(1, len(texts)):
+            self.assertTrue(
+                texts[i].startswith(texts[i - 1]) or texts[i] == texts[i - 1],
+                f"transcript shrunk between frames: {texts[i-1]!r} → {texts[i]!r}",
+            )
+        self.assertIn("好的, A.", events[-1].text)
+        self.assertIn("B 继续完了。", events[-1].text)
+        self.assertTrue(events[-1].is_final)
+
+
 if __name__ == "__main__":
     unittest.main()

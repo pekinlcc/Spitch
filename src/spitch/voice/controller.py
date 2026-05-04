@@ -248,19 +248,24 @@ class VoiceController:
             async def _consume() -> bool:
                 """Drain events until cancel or end-of-stream.
 
-                Each ``evt.text`` is the **accumulated full transcript**
-                (built by :func:`extract_full_text` from every
-                ``utterances[].text``). We don't have to do segment
-                accumulation here — ``evt.text`` is already correct
-                across utterance boundaries.
+                Doubao does NOT keep finalized utterances visible across
+                frames. Once a server frame marks an utterance
+                ``definite=true``, the *next* frame's ``utterances[]``
+                drops it entirely — the array contains only the in-progress
+                utterance, and ``result.text`` likewise reflects only
+                that. So even ``extract_full_text`` (which concatenates
+                the current frame's array) can't see previously
+                finalized segments — they're already gone from the wire.
 
-                ``evt.is_final`` is True only after every utterance is
-                ``definite=true``, which the server emits after
-                receiving our EOS audio frame. Either way, we treat
-                stream EOF (sender finished + ws closed) as the
-                signal to commit, so even a truncated session can
-                paste the latest accumulated text.
+                We have to track them client-side. ``confirmed_finals``
+                accumulates every ``definite=true`` utterance we've
+                seen, with end-dedup so a finalized utterance staying
+                in the array for multiple frames isn't double-appended.
+                The tray label / inject text always show:
+
+                    "".join(confirmed_finals) + current_in_progress
                 """
+                confirmed_finals: list[str] = []
                 last_text = ""
                 try:
                     while True:
@@ -270,10 +275,41 @@ class VoiceController:
                             break
                         if self._cancel.is_set():
                             return False
-                        if evt.text:
-                            last_text = evt.text
-                            self._latest_text = evt.text
-                            self._on_partial(evt.text)
+                        # Pull utterances + current text from the raw payload
+                        # (TranscriptEvent.raw is the full server dict).
+                        payload = evt.raw if isinstance(evt.raw, dict) else {}
+                        result = payload.get("result") or {}
+                        utterances = result.get("utterances") or []
+                        current_in_progress = ""
+                        saw_utterances = False
+                        if isinstance(utterances, list) and utterances:
+                            saw_utterances = True
+                            for u in utterances:
+                                if not isinstance(u, dict):
+                                    continue
+                                u_text = u.get("text", "")
+                                if not isinstance(u_text, str) or not u_text:
+                                    continue
+                                if u.get("definite") is True:
+                                    # End-dedup: a definite utterance can
+                                    # appear in N consecutive frames before
+                                    # the server drops it. Only append once.
+                                    if not confirmed_finals or confirmed_finals[-1] != u_text:
+                                        confirmed_finals.append(u_text)
+                                else:
+                                    if not current_in_progress:
+                                        current_in_progress = u_text
+                        if saw_utterances:
+                            full = "".join(confirmed_finals) + current_in_progress
+                        else:
+                            # No utterances[] in payload — trust evt.text
+                            # as-is (single-utterance fast path / fake
+                            # streaming clients in tests / probe path).
+                            full = evt.text or ""
+                        if full:
+                            last_text = full
+                            self._latest_text = full
+                            self._on_partial(full)
                     # Stream ended normally — commit the accumulated text.
                     if last_text and not self._cancel.is_set():
                         self._on_final(last_text)

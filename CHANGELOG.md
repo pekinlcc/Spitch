@@ -2,6 +2,35 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.8] — 2026-05-04
+
+**真正修好了**长句中段被截断。0.4.6 用 `extract_full_text` 拼接当前帧的 `utterances[]` 数组，**还是不够**——豆包在 utterance 标 `definite=true` **之后的下一帧里把它从数组中完全移除**，只留正在生成的当前段。无论 `result.text` 还是 `utterances[]` 在那之后都看不到那段了。
+
+### 真实抓到的现象（0.4.7 daemon log）
+
+```
+22:54:43,871 partial: …现在说话你能听见吗？好的，我现在想让你提几个关于
+22:54:43,895 partial: …好的，我现在想让你提几个关于    ← "现在说话你能听见吗？" 整段消失！
+```
+
+间隔只有 24 ms 的两帧——前一帧 `utterances=[{现在说话你能听见吗？, def:true}, {好的..., def:false}]`，后一帧 `utterances=[{好的..., def:false}]`。server 把已 finalize 的段从数组里"打扫"掉了。
+
+### 修复
+
+`controller._consume()` 自己维护 `confirmed_finals: list[str]` 累积所有看到过的 `def=true` utterance（用"末尾去重"避免一个 utterance 在 N 帧里 def=true 时被重复 append）。每帧报告：
+
+```python
+"".join(confirmed_finals) + current_in_progress_utterance
+```
+
+server 之后从 wire 里移除掉已确认段，client 这边仍然完整保留。
+
+### 测试
+
+95 个单元测试全部通过。新增 `test_doubao_drops_finalized_utterances_across_frames` —— 用模拟豆包"下一帧丢弃 def=true utterance"的 fake client 跑完整 4 帧，断言最终 final 包含全部 3 段。
+
+---
+
 ## [0.4.7] — 2026-05-04
 
 修复 **WebSocket 冷连接 5 秒导致短句完全没反应**的问题。0.4.6 修了 server 给到的累积全文，但**冷启动时连不上 server**根本拿不到累积全文。

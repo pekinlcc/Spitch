@@ -512,6 +512,14 @@ class DoubaoClient:
             await self._ws.send(encode_audio(tail, last=True, sequence=seq))
 
         sender = asyncio.create_task(_send_audio())
+        # Per-stream accumulator. Doubao silently *drops* finalized
+        # utterances from the response's utterances[] array as the
+        # session goes on, so even extract_full_text() can return a
+        # shorter string on a later frame than it did on an earlier
+        # one. We reconcile here so the caller sees a monotonically
+        # growing transcript across the whole hold.
+        archived = ""    # text we already saw that the server has dropped
+        last_seen = ""   # most recent extract_full_text value
         try:
             while True:
                 try:
@@ -524,11 +532,38 @@ class DoubaoClient:
                 if frame.message_type == SERVER_ERROR_RESPONSE:
                     raise DoubaoProtocolError(f"server error: {frame.payload!r}")
                 if isinstance(frame.payload, dict):
-                    # extract_full_text concatenates every utterance —
-                    # critical for multi-utterance streams where
-                    # result.text alone drops already-finalized segments.
-                    text, is_final = extract_full_text(frame.payload)
-                    yield TranscriptEvent(text=text, is_final=is_final, raw=frame.payload)
+                    segment_text, is_final = extract_full_text(frame.payload)
+                    # Reconcile against the running state so a frame
+                    # where the server has just dropped a finalized
+                    # prefix doesn't make the transcript shrink.
+                    if segment_text:
+                        if segment_text == last_seen:
+                            pass
+                        elif segment_text.startswith(last_seen):
+                            # Normal forward growth.
+                            last_seen = segment_text
+                        elif last_seen.startswith(segment_text):
+                            # Server "shrunk" without dropping anything
+                            # — treat as a no-op; we already had this.
+                            pass
+                        else:
+                            # Reset case: server has rotated some
+                            # finalized text out of utterances[]. Find
+                            # how much of last_seen overlaps the head
+                            # of the new segment_text and archive the
+                            # non-overlapping prefix.
+                            overlap = 0
+                            max_k = min(len(last_seen), len(segment_text))
+                            for k in range(max_k, 0, -1):
+                                if last_seen[-k:] == segment_text[:k]:
+                                    overlap = k
+                                    break
+                            archived += last_seen[: len(last_seen) - overlap]
+                            last_seen = segment_text
+                    full_text = archived + last_seen
+                    yield TranscriptEvent(
+                        text=full_text, is_final=is_final, raw=frame.payload
+                    )
                     # Do NOT return on is_final. Doubao splits long
                     # utterances into multiple definite segments and
                     # keeps streaming as the user keeps talking; if

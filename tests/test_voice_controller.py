@@ -270,6 +270,79 @@ class VoiceControllerTests(unittest.TestCase):
         self.assertTrue(self._wait_state(ctrl, State.IDLE, timeout=3.0))
         self.assertEqual(finals, ["你好世界"])
 
+    def test_doubao_drops_finalized_utterances_across_frames(self):
+        """Reproduce the wire behavior captured in production daemon.log:
+        once Doubao marks an utterance ``definite=true``, the next frame's
+        ``utterances[]`` array DROPS it entirely. Only the in-progress
+        utterance remains in the array, and ``result.text`` reflects only
+        that. The controller has to accumulate finalized segments locally
+        — anything else loses everything before the first segment break.
+        """
+
+        class DoubaoLikeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def stream(self, audio_iter):
+                async for _ in audio_iter:
+                    pass
+                # Frame 1: in-progress only (def=false).
+                yield TranscriptEvent(
+                    "你能听见吗？", False,
+                    {"result": {"text": "你能听见吗？", "utterances": [
+                        {"text": "你能听见吗？", "definite": False},
+                    ]}},
+                )
+                # Frame 2: that utterance is now definite, plus a new
+                # in-progress one. extract_full_text would still see
+                # both here.
+                yield TranscriptEvent(
+                    "你能听见吗？好的", False,
+                    {"result": {"text": "好的", "utterances": [
+                        {"text": "你能听见吗？", "definite": True},
+                        {"text": "好的", "definite": False},
+                    ]}},
+                )
+                # Frame 3: server DROPS the now-finalized first
+                # utterance from the array. Only the in-progress
+                # second one remains. Without client-side accumulation
+                # everything before "好的" is silently lost.
+                yield TranscriptEvent(
+                    "好的", False,
+                    {"result": {"text": "好的", "utterances": [
+                        {"text": "好的", "definite": False},
+                    ]}},
+                )
+                # Frame 4: second utterance becomes definite + a third
+                # in-progress one appears.
+                yield TranscriptEvent(
+                    "好的，再见。", True,
+                    {"result": {"text": "再见。", "utterances": [
+                        {"text": "好的，", "definite": True},
+                        {"text": "再见。", "definite": True},
+                    ]}},
+                )
+
+        audio = FakeAudio([b"\x01" * 320, b"\x02" * 320])
+        finals: list[str] = []
+        ctrl = VoiceController(
+            client_factory=lambda: DoubaoLikeClient(),
+            audio=audio,
+            on_final=finals.append,
+            finalize_timeout=0.3,
+        )
+        ctrl.press()
+        time.sleep(0.05)
+        ctrl.release()
+        self.assertTrue(self._wait_state(ctrl, State.IDLE, timeout=3.0))
+        # Must contain the FULL transcript — first utterance ("你能听
+        # 见吗？") survives even though it was dropped from the wire,
+        # plus the two later ones.
+        self.assertEqual(finals, ["你能听见吗？好的，再见。"])
+
 
 if __name__ == "__main__":
     unittest.main()
