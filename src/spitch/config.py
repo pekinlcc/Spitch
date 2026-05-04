@@ -33,6 +33,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "audio": {
         "device": None,
         "sample_rate": 16000,
+        # Continuous-capture pre-buffer length in ms. The mic is opened
+        # at daemon start and audio fills a ring of this many ms; on
+        # press we replay the ring into the session so the first words
+        # are not lost to mic-startup latency (PortAudio + ALSA combine
+        # for a 50–500 ms gap before PCM actually flows). 500 ms is
+        # safe across desktops. Set to 0 to fall back to the legacy
+        # "open mic on press, close on release" behavior — gives back
+        # the always-on-mic but loses the head of every utterance.
+        "prebuffer_ms": 500,
     },
     "hotkey": {
         "talk_key": "Ctrl+Alt",

@@ -61,6 +61,11 @@ def _notify(summary: str, body: str = "") -> None:
 class SpitchDaemon:
     def __init__(self, cfg: dict):
         self._cfg = cfg
+        # Audio capture lives across sessions in continuous-capture
+        # mode; daemon owns its lifecycle (open at run() start, close
+        # at shutdown). Stored here so run() can call open()/close()
+        # on the same instance the controller is using.
+        self._audio: Optional[AudioCapture] = None
         # Per-press queue: created in _on_press, captured by _on_release
         # before the next press can replace it. Decouples session state
         # from shared-mutable globals so a fast re-press can't blank out
@@ -97,11 +102,18 @@ class SpitchDaemon:
                 "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel",
             ),
         )
-        sample_rate = (self._cfg.get("audio") or {}).get("sample_rate", 16000)
-        audio = AudioCapture(AudioConfig(sample_rate=sample_rate))
+        audio_cfg = self._cfg.get("audio") or {}
+        sample_rate = audio_cfg.get("sample_rate", 16000)
+        try:
+            prebuffer_ms = int(audio_cfg.get("prebuffer_ms", 500))
+        except (TypeError, ValueError):
+            prebuffer_ms = 500
+        self._audio = AudioCapture(
+            AudioConfig(sample_rate=sample_rate, prebuffer_ms=prebuffer_ms)
+        )
         return VoiceController(
             client_factory=lambda: DoubaoClient(creds, sample_rate=sample_rate),
-            audio=audio,
+            audio=self._audio,
             on_partial=self._on_partial,
             on_final=self._on_final,
             on_error=self._on_error,
@@ -286,6 +298,24 @@ class SpitchDaemon:
         except RuntimeError as exc:
             print(f"spitch: {exc}", file=sys.stderr)
             return 3
+        # Pre-open the mic so the very first press doesn't pay the
+        # 50–500 ms backend warm-up latency that otherwise eats the
+        # head of the user's first utterance. With prebuffer_ms == 0
+        # this is a no-op and we fall back to open-on-press.
+        if self._audio is not None:
+            try:
+                backend = self._audio.open()
+                if backend:
+                    log.info("audio backend warmed up: %s", backend)
+            except Exception as exc:
+                # If continuous capture failed (busy device, missing
+                # backend), don't kill the daemon — fall back to
+                # open-on-press by leaving the mic closed. The first
+                # press's audio.start() will retry and surface a real
+                # error to the user via the controller.
+                log.warning(
+                    "could not pre-open mic (%s) — will open on press", exc
+                )
         log.info("Spitch daemon ready — hold %s to talk", "+".join(combo))
         _notify(
             "Spitch ready",
@@ -324,8 +354,7 @@ class SpitchDaemon:
             try:
                 Gtk.main()
             finally:
-                if self._listener:
-                    self._listener.stop()
+                self._shutdown()
             return 0
 
         stop = threading.Event()
@@ -334,9 +363,26 @@ class SpitchDaemon:
         try:
             stop.wait()
         finally:
-            if self._listener:
-                self._listener.stop()
+            self._shutdown()
         return 0
+
+    def _shutdown(self) -> None:
+        """Clean shutdown: stop hotkey listener and close the mic.
+
+        Called from both the GTK and headless main loops on exit. The
+        mic close releases the ALSA / PortAudio handle so a re-launch
+        of the daemon doesn't hit "device busy" on the same hardware.
+        """
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+        if self._audio is not None:
+            try:
+                self._audio.close()
+            except Exception:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
