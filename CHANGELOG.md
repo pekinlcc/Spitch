@@ -2,6 +2,22 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.3] — 2026-05-04
+
+补丁版本——0.4.2 改的 `restore_delay_ms` 默认值**没生效**。原因：值通过 `config.py:DEFAULT_CONFIG` 注入到运行时配置，daemon 用 `inject_cfg.get(key, 800)` 读它的时候 key 已经存在（值是 300），fallback 800 永远走不到。
+
+### 修复
+
+- **`config.py:DEFAULT_CONFIG.inject.restore_clipboard_delay_ms`**：300 → **800**
+  - 这是真正生效的默认值。daemon.py 和 inject_text 里的 800 fallback 仅在 key 缺失时启用，但 `_deep_merge` 总是会把 `DEFAULT_CONFIG` 的字段合并进来，所以那两个 fallback 实际是死代码。
+  - 现有用户的 `~/.config/spitch/config.json` 如果 `inject` section 是空的（默认情况）会自动获得 800；如果有人手动写过 300，需要删掉那行或改成 800。
+
+### 测试
+
+88 个单元测试全部通过。
+
+---
+
 ## [0.4.2] — 2026-05-04
 
 修复了**长文本粘贴只粘到一部分**的 race。0.4.1 修对了"server 给的 final 是完整全文"，但**剪贴板 → 粘贴**这一步本身存在两个时序漏洞，导致目标应用读到的不是我们写入的文本，而是旧剪贴板或者半截内容。

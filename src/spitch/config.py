@@ -55,12 +55,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Ctrl+Shift+V is bound to "Open Preview").
         "paste_keystroke": "Ctrl+Shift+V",
         # How long to wait after sending the paste keystroke before
-        # restoring the user's prior clipboard contents. Slow Electron
-        # apps (Feishu, Slack on a busy machine) can take 500–800 ms to
-        # actually consume the paste; if we restore too early they
-        # paste the OLD clipboard instead. Bump this if you see paste
-        # land as the previously-copied text.
-        "restore_clipboard_delay_ms": 300,
+        # restoring the user's prior clipboard contents. Chromium /
+        # Electron apps (Claude Code, VS Code, Slack, Feishu, Discord)
+        # read the clipboard via an *async Promise* that can take
+        # 300–700 ms to resolve on long CJK strings; if we restore too
+        # early they read the OLD clipboard and paste only part (or
+        # none) of the recognized text. 800 ms is safe for the slowest
+        # Electron app we've tested. Lower it to 200–300 if you only
+        # ever paste into traditional GTK/Qt apps that read the
+        # clipboard synchronously.
+        "restore_clipboard_delay_ms": 800,
     },
     "verified_at": None,
     "verified_signature": None,
