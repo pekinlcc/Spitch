@@ -227,20 +227,45 @@ def _send_paste_keystroke(spec: str = "Ctrl+Shift+V") -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
+# How long to wait after writing the clipboard before synthesizing the
+# paste keystroke. wl-copy / xclip both daemonize their clipboard owner
+# *asynchronously* — `subprocess.run` returns the moment the parent
+# forks, but the child process may still be registering the selection
+# offer with the compositor. If we synthesize Ctrl+Shift+V before the
+# child has registered, the focused application's clipboard request
+# can race and read the *previous* selection (saved) instead of our
+# new text. 80 ms is enough on GNOME/KDE Wayland and X11.
+_CLIPBOARD_SETTLE_S = 0.08
+
+# Default delay between the paste keystroke and the clipboard restore.
+# Electron / Chromium-based apps (Claude Code, VS Code, Slack, Feishu,
+# Discord) read the clipboard *asynchronously* — the keystroke arrives,
+# the renderer schedules a clipboard.readText() Promise, and the actual
+# read can take 300–700 ms on a long CJK string. If we restore the
+# saved clipboard before that read completes the app sees the saved
+# content (or, if saved is empty / partially differing in length, only
+# part of our text). 800 ms is safe for the slowest apps we've tested
+# without being annoying when a user manually pastes again immediately
+# after speaking.
+_DEFAULT_RESTORE_DELAY_MS = 800
+
+
 def inject_text(
     text: str,
     *,
     paste_keystroke: str = "Ctrl+Shift+V",
     restore_clipboard: bool = True,
-    restore_delay_ms: int = 300,
+    restore_delay_ms: int = _DEFAULT_RESTORE_DELAY_MS,
 ) -> Tuple[bool, str]:
     """Paste ``text`` into the focused app.
 
     Steps:
       1. Save current clipboard (if ``restore_clipboard``).
       2. Write ``text`` to clipboard.
-      3. Send the configured paste keystroke via uinput.
-      4. After ``restore_delay_ms`` milliseconds, restore the saved
+      3. Wait for the clipboard helper's daemonized child to actually
+         register the selection offer with the compositor.
+      4. Send the configured paste keystroke via uinput.
+      5. After ``restore_delay_ms`` milliseconds, restore the saved
          clipboard so we don't surprise the user with stale content
          next time they paste manually. The restore runs in
          ``finally`` so it also fires on failure paths after the
@@ -248,8 +273,9 @@ def inject_text(
 
     ``paste_keystroke`` defaults to ``Ctrl+Shift+V`` — works in terminals
     (where Ctrl+V is literal-quote), browsers, Slack, Feishu, etc.
-    ``restore_delay_ms`` defaults to 300 ms; bump it to 600–800 ms if
-    your target Electron app is slow to consume the paste.
+    ``restore_delay_ms`` defaults to 800 ms; lower it if you only paste
+    into apps that read the clipboard synchronously, raise it if your
+    target Electron app is even slower.
 
     Returns ``(ok, reason)``. ``reason`` is empty on success and a
     short human-readable string on failure (so the daemon can surface
@@ -267,14 +293,27 @@ def inject_text(
         msg = "no clipboard helper found — install wl-clipboard (Wayland) or xclip/xsel (X11)"
         log.error(msg)
         return False, msg
+    log.info(
+        "inject_text: backend=%s text_len=%d preview=%r",
+        backend, len(text), text[:60] + ("…" if len(text) > 60 else ""),
+    )
     saved = _paste(backend) if restore_clipboard else None
+    log.info(
+        "inject_text: saved=%s",
+        f"{len(saved)} bytes" if saved is not None else "(disabled or empty)",
+    )
     clipboard_was_overwritten = False
     try:
         ok, reason = _copy(text.encode("utf-8"), backend)
+        log.info("inject_text: _copy ok=%s reason=%r", ok, reason)
         if not ok:
             return False, reason
         clipboard_was_overwritten = True
+        # Let the clipboard helper's daemonized child actually
+        # register the new selection offer before we paste.
+        time.sleep(_CLIPBOARD_SETTLE_S)
         ok, reason = _send_paste_keystroke(paste_keystroke)
+        log.info("inject_text: keystroke ok=%s reason=%r", ok, reason)
         if not ok:
             return False, reason
         return True, ""
@@ -284,8 +323,11 @@ def inject_text(
             # before we overwrite the clipboard with the saved bytes.
             # Runs even on the failure path so the user gets their
             # original clipboard back if our paste failed mid-way.
-            time.sleep(max(0.0, restore_delay_ms / 1000.0))
+            settle_s = max(0.0, restore_delay_ms / 1000.0)
+            log.info("inject_text: sleeping %.2fs before restoring clipboard", settle_s)
+            time.sleep(settle_s)
             try:
                 _copy(saved, backend)
-            except Exception:
-                pass
+                log.info("inject_text: clipboard restored")
+            except Exception as exc:
+                log.warning("inject_text: clipboard restore failed: %s", exc)

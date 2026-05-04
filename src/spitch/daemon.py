@@ -240,7 +240,12 @@ class SpitchDaemon:
             log.warning("no final transcript within %.1fs", self._finalize_timeout)
             return
         if not text:
+            log.warning("inject: empty text from queue, aborting")
             return
+        log.info(
+            "inject: prep text len=%d preview=%r",
+            len(text), text[:60] + ("…" if len(text) > 60 else ""),
+        )
         # Wait for the user to physically release all hotkey modifiers
         # before we synthesize Ctrl+V — otherwise the still-held Alt
         # would turn our paste into Ctrl+Alt+V (a different shortcut).
@@ -248,13 +253,18 @@ class SpitchDaemon:
         # the last modifier; blocking on it idle-burns 0% CPU between
         # presses (the previous busy-poll spent 50 wakeups/s here).
         if self._listener is not None:
-            self._listener.wait_quiescent(timeout=2.0)
+            quiescent = self._listener.wait_quiescent(timeout=2.0)
+            if not quiescent:
+                log.warning(
+                    "inject: hotkey modifiers still held after 2s — "
+                    "synthesized paste will fight the held modifiers"
+                )
         inject_cfg = self._cfg.get("inject") or {}
         keystroke = inject_cfg.get("paste_keystroke", "Ctrl+Shift+V")
         try:
-            restore_delay_ms = int(inject_cfg.get("restore_clipboard_delay_ms", 300))
+            restore_delay_ms = int(inject_cfg.get("restore_clipboard_delay_ms", 800))
         except (TypeError, ValueError):
-            restore_delay_ms = 300
+            restore_delay_ms = 800
         # Hold the lock across the whole clipboard write + keystroke +
         # restore so a second inject thread can't slip in between, copy
         # its text, and have us paste it for them.
@@ -264,6 +274,7 @@ class SpitchDaemon:
                 paste_keystroke=keystroke,
                 restore_delay_ms=restore_delay_ms,
             )
+        log.info("inject: result ok=%s reason=%r", ok, reason)
         if not ok:
             _notify("Spitch — inject failed", reason or "unknown error")
 

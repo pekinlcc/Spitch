@@ -2,6 +2,27 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.2] — 2026-05-04
+
+修复了**长文本粘贴只粘到一部分**的 race。0.4.1 修对了"server 给的 final 是完整全文"，但**剪贴板 → 粘贴**这一步本身存在两个时序漏洞，导致目标应用读到的不是我们写入的文本，而是旧剪贴板或者半截内容。
+
+### 修复
+
+- **wl-copy / xclip 异步注册剪贴板的 race**：这两个工具默认 fork 到后台，`subprocess.run` 在父进程退出时立即返回，但**子进程**（真正持有剪贴板的那个）注册 selection offer 给 compositor 是异步的。原来代码紧接着就合成 `Ctrl+Shift+V`，应用拿到 paste 信号请求 clipboard 时子进程还没 register，读到的是**旧的** selection（saved 内容或空）。新增 80 ms settle 让子进程 ready 再发按键。
+- **Electron / Chromium 类应用异步读取 clipboard 被 restore 截胡**：Claude Code、VS Code、Slack、Feishu、Discord 等基于 Chromium 的应用在收到粘贴键后会 schedule 一个 `clipboard.readText()` Promise，长 CJK 文本下这个异步 read 可能要 300–700 ms 才完成。原默认 `restore_clipboard_delay_ms=300` 太激进——还原线程已经把剪贴板写回 saved，应用 Promise 才 resolve，于是应用读到的是 saved 不是我们的转写文本。默认改成 **800 ms**，覆盖目前测试过最慢的 Electron 应用。
+- **inject 链路全程加详细日志**：`daemon.log` 里现在会写每一步：`inject: prep text len=… preview=…`、`_copy ok=…`、`keystroke ok=…`、`clipboard restored`、`inject: result ok=…`。下次再出诡异的"粘出来不全"问题可以一眼定位是 server / queue / clipboard / keystroke / restore 哪一步丢的。
+- **`wait_quiescent` 超时时显式告警**：用户长时间不松开 modifier 时（>2 秒）日志会写 `synthesized paste will fight the held modifiers`，而不是默默继续合成会被 modifier 干扰的按键。
+
+### 配置
+
+- `inject.restore_clipboard_delay_ms` 默认值 300 → **800**。如果你只用同步剪贴板的"传统"应用（gedit、vim）想要更快还原，把它调到 200–300 也能 work。
+
+### 测试
+
+88 个单元测试全部通过；新增的 `time.sleep(0.08)` 不在单测路径上（单测打 stub 跳过 `subprocess`）。
+
+---
+
 ## [0.4.1] — 2026-05-04
 
 修复了**长句中段被截断**的关键 bug — 用户按住 Ctrl+Alt 说一段较长、中间有自然停顿的句子时，最后注入的文本只有第一段，停顿之后说的内容全部丢失。
