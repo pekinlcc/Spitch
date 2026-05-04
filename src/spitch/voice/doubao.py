@@ -476,8 +476,14 @@ class DoubaoClient:
                 if isinstance(frame.payload, dict):
                     text, is_final = extract_text(frame.payload)
                     yield TranscriptEvent(text=text, is_final=is_final, raw=frame.payload)
-                    if is_final:
-                        return
+                    # Do NOT return on is_final. Doubao splits long
+                    # utterances into multiple definite segments and
+                    # keeps streaming as the user keeps talking; if
+                    # we exit on the first one, everything spoken
+                    # after it is silently lost. The session ends
+                    # naturally when our audio sender finishes (user
+                    # released the talk key, EOS frame went out, ws
+                    # close response comes back).
         finally:
             if not sender.done():
                 sender.cancel()

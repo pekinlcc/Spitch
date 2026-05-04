@@ -241,24 +241,59 @@ class VoiceController:
             stream = live.stream(chunks_gen).__aiter__()
 
             async def _consume() -> bool:
-                """Drain events until cancel or final. Return True iff a final fired."""
+                """Drain events until cancel or end-of-stream. Return True iff a final fired.
+
+                Doubao marks each utterance segment ``definite=true`` as
+                soon as it's stable, even while the user is still
+                speaking the rest of the sentence. We must NOT exit on
+                the first such marker — instead we cache it as
+                "best final so far" and keep consuming. The session
+                ends naturally when the WebSocket stream closes (user
+                released the talk key, EOS frame went out, server
+                acknowledged), at which point we commit the most
+                recent definite text.
+                """
+                last_final_text = ""
+                saw_any_final = False
                 try:
                     while True:
                         try:
                             evt = await stream.__anext__()
                         except StopAsyncIteration:
-                            return False
+                            break
                         if self._cancel.is_set():
                             return False
                         if evt.text:
                             self._latest_text = evt.text
                             if evt.is_final:
-                                self._on_final(evt.text)
-                                return True
-                            self._on_partial(evt.text)
+                                # Remember it but stay in the loop —
+                                # more partials / finals may follow as
+                                # the user keeps talking.
+                                saw_any_final = True
+                                last_final_text = evt.text
+                                # Surface it as a partial too so the
+                                # tray label keeps updating across
+                                # the segment boundary; the actual
+                                # on_final fires once at EOS below.
+                                self._on_partial(evt.text)
+                            else:
+                                self._on_partial(evt.text)
+                    # Stream ended normally — commit the last definite
+                    # text we got. If we never saw a definite frame,
+                    # leave it to the FINALIZING-timeout fallback in
+                    # _session_coro to commit latest_text.
+                    if saw_any_final and last_final_text and not self._cancel.is_set():
+                        self._on_final(last_final_text)
+                        return True
+                    return False
                 except Exception:
-                    if not self._cancel.is_set() and self._latest_text:
-                        self._on_final(self._latest_text)
+                    if not self._cancel.is_set():
+                        # Prefer the last definite text over the bare
+                        # latest partial — definite frames have been
+                        # ITN-normalized + punctuated by the server.
+                        commit = last_final_text or self._latest_text
+                        if commit:
+                            self._on_final(commit)
                     raise
 
             consume_task: asyncio.Task | None = None

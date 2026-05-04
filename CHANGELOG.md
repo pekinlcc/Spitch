@@ -2,6 +2,23 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] — 2026-05-04
+
+修复了**长句中段被截断**的关键 bug — 用户按住 Ctrl+Alt 说一段较长、中间有自然停顿的句子时，最后注入的文本只有第一段，停顿之后说的内容全部丢失。
+
+### 修复
+
+- **RECORDING 期间收到 `definite=true` 提前关 session 导致后半截丢失**：豆包对长句会按"语义停顿"分段，每段稳定就给 `definite=true`。原来 `controller.py:_consume()` 看到第一个 `is_final=True` 就立刻 `on_final` 并退出 session；`doubao.py:stream()` 也会在那帧之后 `return`，关掉 WebSocket。结果用户**还在按着**热键继续说的内容完全收不到。
+  - `stream()` 移除 `is_final` 时的 `return`，session 由 audio EOS（用户松键发出 `NEG_WITH_SEQUENCE`）自然终止
+  - `_consume()` 在 RECORDING 期间收到 `is_final` 改为缓存 `last_final_text` 并继续读，直到 stream 关闭再触发一次 `on_final(last_final_text)`
+  - 同时把每段 `definite=true` 也透传给 `on_partial`，tray label 跨段不会"卡死"在第一段的尾巴
+
+### 测试
+
+88 个单元测试全部通过；fake streaming client 在发完 `is_final=True` 后通过 `__aiter__` 自然耗尽来模拟新的"audio EOS 才结束"语义，行为兼容。
+
+---
+
 ## [0.4.0] — 2026-05-04
 
 托盘 UX 重做：把"录音中 / 转写中"的反馈从 Ubuntu 顶部弹的桌面通知 popup 搬进右上角 tray label，并加了 About 对话框看版本号。配置文件层面**完全向后兼容**——没有新增配置字段。
