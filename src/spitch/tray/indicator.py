@@ -165,6 +165,13 @@ class SpitchIndicator:
         item_status.set_sensitive(False)
         menu.append(item_status)
         menu.append(Gtk.SeparatorMenuItem())
+        item_console = Gtk.MenuItem(label="打开控制台 (Open Console)…")
+        item_console.connect("activate", self._on_open_console)
+        menu.append(item_console)
+        item_repaste = Gtk.MenuItem(label="重粘最近一次 (Repaste latest)")
+        item_repaste.connect("activate", self._on_repaste_latest)
+        menu.append(item_repaste)
+        menu.append(Gtk.SeparatorMenuItem())
         item_config = Gtk.MenuItem(label="Configure…")
         item_config.connect("activate", self._on_open_config)
         menu.append(item_config)
@@ -178,6 +185,23 @@ class SpitchIndicator:
         menu.show_all()
         self._item_status = item_status
         return menu
+
+    def _on_open_console(self, _widget):
+        import shutil, subprocess
+        if shutil.which("spitch-console"):
+            subprocess.Popen(["spitch-console"])
+        else:
+            log.info("spitch-console not on PATH; re-run install.sh")
+
+    def _on_repaste_latest(self, _widget):
+        # Pure best-effort: if cmd socket isn't reachable, stay silent
+        # (the daemon is the same process anyway, but the menu hops
+        # through the cli channel for a uniform code path).
+        try:
+            from ..cmdsock import call as cmd_call
+            cmd_call("repaste", index=-1)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("repaste latest failed: %s", exc)
 
     def _on_open_config(self, _widget):
         import shutil, subprocess

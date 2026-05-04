@@ -19,7 +19,8 @@
 - **全局热键**：默认 `Ctrl+Alt` 双键长按；按下第三键（如 `Ctrl+Alt+T`）自动取消，让系统快捷键正常生效
 - **真·实时 ASR**：豆包 BigModel 实时端点，自带标点 + 数字归一（ITN），中文一次性输出
 - **绕过 IM 框架**：转写结果走"剪贴板 + 合成 `Ctrl+Shift+V`"，在 GTK / Qt / Electron / 原生 Wayland 应用里都能粘——飞书、微信、VS Code、Chrome 地址栏、Slack 全都覆盖
-- **系统托盘**：libayatana-appindicator，三态图标（空闲 / 录音中 / 正在转写）
+- **历史 / 重粘 / 控制台**（v0.5）：daemon 保留最近 50 条转写。`spitch-console` 三 tab 窗口（历史 / 日志 / 设置），托盘菜单一键打开；`spitch-cli repaste` 可绑定到任何系统快捷键，失败/想再发一遍时一键补救
+- **系统托盘**：libayatana-appindicator，三态图标（空闲 / 录音中 / 正在转写）；菜单含"打开控制台""重粘最近一次"
 - **配置 UI**：GTK 对话框；缺 PyGObject 时自动退到 CLI 提示
 - **凭据安全**：配置文件 chmod 600 + 原子写；凭据指纹绑定 verified 状态，改了 key 自动失效
 - **Wayland 与 X11 双栈**：自动选 `wl-copy` / `xclip` / `xsel`
@@ -75,10 +76,30 @@ spitch-daemon &      # 按住 Ctrl+Alt 说话，松开后自动粘贴
 | `audio.prebuffer_ms` | 常驻麦克风的环形预缓冲长度（ms）。修复"按下后说的前半截被吃掉"——按下时回放这段缓冲。设为 0 = 关闭常驻麦克风，按下才开 | `500` |
 | `hotkey.talk_key` | 按住说话的修饰键组合 | `Ctrl+Alt` |
 | `inject.paste_keystroke` | 粘贴用的合成快捷键 | `Ctrl+Shift+V` |
-| `inject.restore_clipboard_delay_ms` | 粘贴后等多久才把剪贴板还原（ms） | `300` |
+| `inject.restore_clipboard_delay_ms` | 粘贴后等多久才把剪贴板还原（ms） | `800` |
 | `inject.final_wait_seconds` | 等 server 出 final 的最长秒数 | `5.0` |
+| `history.capacity` | 最近转写历史保留条数 | `50` |
 
 修改后重启 daemon 生效。
+
+## 控制台 / 历史 / 重粘
+
+v0.5 起 daemon 维护最近 50 条转写历史，提供三种使用方式：
+
+- **托盘菜单**：右键托盘图标 → "打开控制台"。三 tab 窗口：
+  - 历史：复制 / 重粘 / 删除任何一条
+  - 日志：实时 tail `~/.local/state/spitch/daemon.log`
+  - 设置：常用配置项的图形界面（不含凭据，凭据仍走 spitch-config）
+- **`spitch-cli`**：命令行同样能管历史
+  ```bash
+  spitch-cli list           # 查看历史
+  spitch-cli repaste        # 重粘最近一次
+  spitch-cli repaste --index 3  # 重粘第 3 条
+  spitch-cli clear          # 清空
+  ```
+- **绑定到系统快捷键**：把 `spitch-cli repaste` 绑到 GNOME Settings → 键盘 → 自定义快捷键（推荐 `Super+Z`）。任何时候上次粘漏了 / 想再发一遍，一个键补救。
+
+历史持久化在 `~/.local/state/spitch/history.jsonl`（chmod 600，跨 daemon 重启保留）。
 
 ## 常见问题
 

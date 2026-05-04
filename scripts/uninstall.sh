@@ -5,10 +5,12 @@ set -euo pipefail
 
 BIN_DAEMON="$HOME/.local/bin/spitch-daemon"
 BIN_CONFIG="$HOME/.local/bin/spitch-config"
+BIN_CLI="$HOME/.local/bin/spitch-cli"
+BIN_CONSOLE="$HOME/.local/bin/spitch-console"
 SYSTEMD_UNIT="$HOME/.config/systemd/user/spitch.service"
 
 removed_any=0
-for f in "$BIN_DAEMON" "$BIN_CONFIG" "$SYSTEMD_UNIT"; do
+for f in "$BIN_DAEMON" "$BIN_CONFIG" "$BIN_CLI" "$BIN_CONSOLE" "$SYSTEMD_UNIT"; do
     if [ -e "$f" ]; then
         rm -f "$f"
         echo "spitch-uninstall: removed $f"

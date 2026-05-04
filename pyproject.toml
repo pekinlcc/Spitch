@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spitch"
-version = "0.4.8"
+version = "0.5.0"
 description = "Global-hotkey voice input for Linux desktops, powered by Doubao realtime ASR"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,6 +38,8 @@ test = [
 [project.scripts]
 spitch = "spitch.__main__:main"
 spitch-config = "spitch.ui.config_dialog:main"
+spitch-cli = "spitch.cli:main"
+spitch-console = "spitch.ui.console:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

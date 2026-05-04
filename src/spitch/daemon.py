@@ -24,7 +24,9 @@ import threading
 import time
 from typing import Optional
 
+from .cmdsock import CmdServer, default_socket_path
 from .config import is_complete, is_verified, load_config
+from .history import HistoryEntry, HistoryRing, default_history_path
 from .hotkey import HotkeyListener, parse_combo
 from .inject import inject_text
 from .tray import try_create as try_create_indicator
@@ -38,6 +40,32 @@ from .voice import (
 )
 
 log = logging.getLogger("spitch.daemon")
+
+
+def _active_window_label() -> str:
+    """Best-effort label for the currently-focused window. Used as a
+    metadata tag in history entries — the user looking at history
+    might want to know which app they were dictating into.
+
+    Tries a couple of common Linux window-info tools and gives up
+    silently if none are available. Empty string means "unknown".
+    """
+    # xdotool works on X11 + XWayland.
+    if shutil.which("xdotool"):
+        try:
+            r = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                capture_output=True, timeout=0.3, text=True,
+            )
+            if r.returncode == 0:
+                name = r.stdout.strip()
+                if name:
+                    return name[:80]
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    # Wayland (GNOME / KDE) doesn't expose a portable focused-window
+    # API to unprivileged clients, so we just return empty.
+    return ""
 
 
 def _notify(summary: str, body: str = "") -> None:
@@ -91,6 +119,23 @@ class SpitchDaemon:
         # lock they'd race on the clipboard and on /dev/uinput, producing
         # interleaved keystrokes and stomped clipboard contents.
         self._inject_lock = threading.Lock()
+        # v0.5: recent-transcript history + cmd socket. The console UI
+        # and the spitch-cli tool both talk to the daemon via this
+        # socket to list / re-paste / clear history without restarting.
+        history_capacity = 50
+        try:
+            history_capacity = int((cfg.get("history") or {}).get("capacity", 50))
+        except (TypeError, ValueError):
+            history_capacity = 50
+        self._history = HistoryRing(
+            capacity=history_capacity,
+            path=default_history_path(),
+        )
+        self._cmdserver: Optional[CmdServer] = None
+        # When set, _finalize_and_inject stamps the time the press
+        # was accepted so we can record the recording duration in
+        # the history entry.
+        self._press_started_at: float = 0.0
 
     def _build_voice(self) -> VoiceController:
         d = self._cfg["doubao"]
@@ -189,6 +234,7 @@ class SpitchDaemon:
             return
         self._pending_final = new_pending
         self._press_accepted = True
+        self._press_started_at = time.time()
         log.info("press: session started (state=%s)", self._voice.state)
 
     def _on_release(self) -> None:
@@ -238,6 +284,7 @@ class SpitchDaemon:
     # -- finalize+inject ----------------------------------------------
 
     def _finalize_and_inject(self, pending: "queue.Queue[str]") -> None:
+        press_started = self._press_started_at or time.time()
         try:
             text = pending.get(timeout=self._finalize_timeout)
         except queue.Empty:
@@ -263,24 +310,83 @@ class SpitchDaemon:
                     "inject: hotkey modifiers still held after 2s — "
                     "synthesized paste will fight the held modifiers"
                 )
+        ok, reason = self._inject_text_locked(text)
+        log.info("inject: result ok=%s reason=%r", ok, reason)
+        if not ok:
+            _notify("Spitch — inject failed", reason or "unknown error")
+        # Record this session in history regardless of inject success —
+        # the user may want to repaste a session whose first inject was
+        # eaten by a slow Electron app.
+        try:
+            self._history.append(HistoryEntry(
+                timestamp=time.time(),
+                text=text,
+                duration_s=max(0.0, time.time() - press_started),
+                inject_ok=bool(ok),
+                target_app=_active_window_label(),
+            ))
+        except Exception:
+            log.exception("history append failed (non-fatal)")
+
+    def _inject_text_locked(self, text: str) -> tuple[bool, str]:
+        """Run inject_text with the daemon's serialization lock applied.
+
+        Used both by _finalize_and_inject (live press) and by
+        cmdsock repaste handlers (console / cli).
+        """
         inject_cfg = self._cfg.get("inject") or {}
         keystroke = inject_cfg.get("paste_keystroke", "Ctrl+Shift+V")
         try:
             restore_delay_ms = int(inject_cfg.get("restore_clipboard_delay_ms", 800))
         except (TypeError, ValueError):
             restore_delay_ms = 800
-        # Hold the lock across the whole clipboard write + keystroke +
-        # restore so a second inject thread can't slip in between, copy
-        # its text, and have us paste it for them.
         with self._inject_lock:
-            ok, reason = inject_text(
+            return inject_text(
                 text,
                 paste_keystroke=keystroke,
                 restore_delay_ms=restore_delay_ms,
             )
-        log.info("inject: result ok=%s reason=%r", ok, reason)
-        if not ok:
-            _notify("Spitch — inject failed", reason or "unknown error")
+
+    # -- cmd socket handlers (called from the cmdsock thread) ----------
+
+    def _cmd_ping(self, _req: dict) -> dict:
+        from . import __version__
+        return {"version": __version__}
+
+    def _cmd_list_history(self, _req: dict) -> dict:
+        return {"entries": [e.to_dict() for e in self._history.all()]}
+
+    def _cmd_repaste(self, req: dict) -> dict:
+        try:
+            index = int(req.get("index", -1))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "index must be an integer"}
+        entry = self._history.get(index)
+        if entry is None:
+            return {"ok": False, "error": f"no history entry at index {index}"}
+        # Spawn a worker thread so the cmdsock response returns
+        # immediately — paste involves uinput keystrokes + 800ms
+        # restore-delay sleep.
+        def _do():
+            ok, reason = self._inject_text_locked(entry.text)
+            log.info("repaste: ok=%s reason=%r", ok, reason)
+            if not ok:
+                _notify("Spitch — repaste failed", reason or "unknown error")
+        threading.Thread(target=_do, name="spitch-repaste", daemon=True).start()
+        return {"ok": True, "scheduled": True, "text_preview": entry.text[:60]}
+
+    def _cmd_delete_history(self, req: dict) -> dict:
+        try:
+            index = int(req.get("index"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "index must be an integer"}
+        if not self._history.remove(index):
+            return {"ok": False, "error": f"no history entry at index {index}"}
+        return {"ok": True}
+
+    def _cmd_clear_history(self, _req: dict) -> dict:
+        self._history.clear()
+        return {"ok": True}
 
     # -- main loop ----------------------------------------------------
 
@@ -363,6 +469,28 @@ class SpitchDaemon:
             name="spitch-warmup",
             daemon=True,
         ).start()
+        # Start the command socket so the console UI / spitch-cli can
+        # list history, repaste an old transcript, etc. Failure is
+        # non-fatal — voice input still works without it.
+        try:
+            self._cmdserver = CmdServer(
+                handlers={
+                    "ping":           self._cmd_ping,
+                    "list":           self._cmd_list_history,
+                    "list_history":   self._cmd_list_history,  # alias
+                    "repaste":        self._cmd_repaste,
+                    "delete":         self._cmd_delete_history,
+                    "delete_history": self._cmd_delete_history,  # alias
+                    "clear":          self._cmd_clear_history,
+                    "clear_history":  self._cmd_clear_history,  # alias
+                },
+                path=default_socket_path(),
+            )
+            self._cmdserver.start()
+        except Exception as exc:
+            log.warning("could not start cmd socket (%s) — console / "
+                        "spitch-cli won't be able to talk to daemon", exc)
+            self._cmdserver = None
         log.info("Spitch daemon ready — hold %s to talk", "+".join(combo))
         _notify(
             "Spitch ready",
@@ -470,7 +598,14 @@ class SpitchDaemon:
         Called from both the GTK and headless main loops on exit. The
         mic close releases the ALSA / PortAudio handle so a re-launch
         of the daemon doesn't hit "device busy" on the same hardware.
+        Also tear down the cmd socket so a stale path doesn't fool
+        ``spitch-cli`` next time the daemon starts.
         """
+        if self._cmdserver is not None:
+            try:
+                self._cmdserver.stop()
+            except Exception:
+                pass
         if self._listener is not None:
             try:
                 self._listener.stop()

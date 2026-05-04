@@ -2,6 +2,50 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] — 2026-05-04
+
+**控制台 / 历史 / 重粘**——把 daemon 从"只能按住说话"扩成"还能管理已识别的内容"。本版前所有失败的转写（被截断、注入到错应用、识别错）都只能再说一遍；从 v0.5 起每段都进历史，托盘 / 命令行 / GTK 三种方式都能补救。
+
+### 新增
+
+- **`HistoryRing`** (`src/spitch/history.py`)：daemon 内存环形缓冲（默认 50 条），同步持久化到 `~/.local/state/spitch/history.jsonl`（chmod 600，跨重启保留）。每段转写自动写入：时间、内容、识别耗时、注入是否成功、目标窗口名。
+- **Unix socket 命令通道** (`src/spitch/cmdsock.py`)：daemon 在 `$XDG_RUNTIME_DIR/spitch.sock` (chmod 600) 监听 JSON-line 协议，支持 `ping` / `list` / `repaste` / `delete` / `clear`。
+- **`spitch-cli`** 命令行工具：
+  ```bash
+  spitch-cli list           # 列历史
+  spitch-cli repaste        # 重粘最近一次
+  spitch-cli repaste --index 3
+  spitch-cli delete 5
+  spitch-cli clear
+  ```
+  设计目的：把 `spitch-cli repaste` 绑到 GNOME Settings 的自定义快捷键（推荐 `Super+Z`），失败/再发一遍一键补救。
+- **`spitch-console`** GTK 三 tab 控制台：
+  - **历史** tab：行选 → 复制 / 重粘 / 删除；双击重粘
+  - **日志** tab：实时 tail `~/.local/state/spitch/daemon.log`，自动滚动 + 复制按钮
+  - **设置** tab：热键 / 粘贴键 / 还原延迟 / 预缓冲 / final 等待 等常用配置图形化（凭据不动，仍走 spitch-config）
+- **托盘菜单**新增两项："打开控制台"、"重粘最近一次"
+- **`history.capacity`** 配置项（默认 50）
+- **`target_app` 字段**：用 `xdotool getactivewindow getwindowname` best-effort 抓焦点窗口名（X11/XWayland），写进历史，方便在控制台里看"这段是粘到 Claude Code 的还是粘到飞书的"
+
+### 内部
+
+- daemon 启动时构造 `HistoryRing` 加载持久化历史 + 启动 `CmdServer` 后台线程
+- `_finalize_and_inject` 抽出 `_inject_text_locked()` helper 复用给 cmdsock 的 repaste 路径
+- 注入完成（成功或失败）都 append 到 history（失败的反而更需要重粘）
+
+### 测试
+
+123 个单元测试全部通过（v0.4.8 是 95 个）。新增：
+- `tests/test_history.py`：19 个测试，覆盖 ring 容量 / 持久化原子性 / chmod 600 / 损坏行容忍 / 并发安全
+- `tests/test_cmdsock.py`：9 个测试，端到端 socket round-trip / 错误处理 / chmod / 默认路径
+
+### 兼容性
+
+- 0.4.x 用户的 `~/.config/spitch/config.json` 不需要改动——`history.capacity` 缺失时取默认 50
+- 老 daemon 没有 cmd socket，新装的 `spitch-cli` 会报 `daemon not running`；先重启 daemon 即可
+
+---
+
 ## [0.4.8] — 2026-05-04
 
 **真正修好了**长句中段被截断。0.4.6 用 `extract_full_text` 拼接当前帧的 `utterances[]` 数组，**还是不够**——豆包在 utterance 标 `definite=true` **之后的下一帧里把它从数组中完全移除**，只留正在生成的当前段。无论 `result.text` 还是 `utterances[]` 在那之后都看不到那段了。
