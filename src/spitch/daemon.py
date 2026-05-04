@@ -125,6 +125,12 @@ class SpitchDaemon:
     def _on_partial(self, text: str) -> None:
         if text:
             log.info("partial: …%s", text[-40:])
+        # Stream partials into the tray label so the user sees what
+        # the server is recognizing in real time. Cheap — the
+        # indicator coalesces via GLib.idle_add and only the latest
+        # value is rendered on the panel.
+        if self._indicator is not None:
+            self._indicator.set_partial(text)
 
     def _on_final(self, text: str) -> None:
         log.info("final: %r", text)
@@ -138,6 +144,12 @@ class SpitchDaemon:
                 q.put_nowait(text)
             except queue.Full:
                 pass
+        # Push the final into the tray too so the user briefly sees
+        # the recognized text under a checkmark after the session
+        # ends. The indicator's IDLE-linger timer keeps it visible
+        # for a short window before the label clears.
+        if self._indicator is not None:
+            self._indicator.set_partial(text)
 
     def _on_error(self, exc: BaseException) -> None:
         log.warning("voice error: %s", exc)
@@ -145,7 +157,15 @@ class SpitchDaemon:
 
     def _on_state(self, s: State) -> None:
         if self._indicator is not None:
+            # Tray icon + label provide all the state feedback the
+            # user needs; suppress the desktop notification popups
+            # that used to fire here so we don't double up with a
+            # less-elegant top-of-screen toast for every press.
             self._indicator.set_state(s)
+            return
+        # Headless fallback (no AppIndicator typelib): keep the
+        # legacy notify-send path so the user still gets *some*
+        # feedback that the daemon registered the press.
         if s == State.RECORDING:
             _notify("🎙 Spitch listening…")
         elif s == State.FINALIZING:
