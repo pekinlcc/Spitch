@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spitch"
-version = "0.4.3"
+version = "0.4.4"
 description = "Global-hotkey voice input for Linux desktops, powered by Doubao realtime ASR"
 readme = "README.md"
 requires-python = ">=3.10"

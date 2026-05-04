@@ -218,6 +218,9 @@ class VoiceController:
             self._set_state(State.ERROR if errored else State.IDLE)
 
     async def _session_coro(self) -> None:
+        import logging
+        log = logging.getLogger("spitch.voice")
+        log.info("session: starting client_factory")
         client = self._client_factory()
         # Convert the sync chunk iterator into an async one without
         # blocking the loop: hand off reads to a thread.
@@ -236,7 +239,9 @@ class VoiceController:
                     return
                 yield chunk
 
+        log.info("session: connecting to ASR endpoint")
         async with client as live:
+            log.info("session: connected, starting stream")
             chunks_gen = _async_chunks()
             stream = live.stream(chunks_gen).__aiter__()
 

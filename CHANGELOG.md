@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.4] — 2026-05-04
+
+诊断日志补丁——把 press / release / session-connect / stream-start 的关键节点加进 `daemon.log`，遇到"按下没反应、partial 不出来"这种安静失败能精确定位是 hotkey 没收到、controller 没启动、ws 没连上、还是 server 没回 partial。
+
+### 新增日志
+
+- `press: session started (state=...)` — 热键被接受、controller 进入 RECORDING
+- `press: voice not idle (state=...)` — 已经有 session 在跑，新按下被拒绝
+- `release: voice.state=..., scheduling inject` — 松键时控制器实际状态、inject 线程已派
+- `release: ignored (no accepted press)` — 松键事件无对应 press（cancel / 启动期老 modifier）
+- `session: starting client_factory` / `session: connecting to ASR endpoint` / `session: connected, starting stream` — 让 ws 连接卡住与"连上但 server 不回 partial"两种故障在日志里能区分
+
+### 测试
+
+88 个单元测试全部通过。
+
+---
+
 ## [0.4.3] — 2026-05-04
 
 补丁版本——0.4.2 改的 `restore_delay_ms` 默认值**没生效**。原因：值通过 `config.py:DEFAULT_CONFIG` 注入到运行时配置，daemon 用 `inject_cfg.get(key, 800)` 读它的时候 key 已经存在（值是 300），fallback 800 永远走不到。

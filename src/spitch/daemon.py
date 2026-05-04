@@ -188,6 +188,7 @@ class SpitchDaemon:
             return
         self._pending_final = new_pending
         self._press_accepted = True
+        log.info("press: session started (state=%s)", self._voice.state)
 
     def _on_release(self) -> None:
         if self._voice is None:
@@ -199,8 +200,10 @@ class SpitchDaemon:
         # the source of truth for "this release pairs with an accepted
         # press of OUR session".
         if not self._press_accepted:
+            log.info("release: ignored (no accepted press)")
             return
         self._press_accepted = False
+        log.info("release: voice.state=%s, scheduling inject", self._voice.state)
         # Capture the queue locally so a later, fast next-press that
         # replaces self._pending_final with Q2 cannot redirect *our*
         # inject thread to the wrong queue. Do NOT clear
