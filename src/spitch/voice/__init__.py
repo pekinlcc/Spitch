@@ -13,6 +13,7 @@ from .doubao import (
     build_request_meta,
     encode_audio,
     encode_full_request,
+    extract_full_text,
     extract_text,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "build_request_meta",
     "encode_audio",
     "encode_full_request",
+    "extract_full_text",
     "extract_text",
 ]

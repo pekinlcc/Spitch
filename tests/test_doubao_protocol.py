@@ -28,6 +28,7 @@ from spitch.voice.doubao import (
     build_request_meta,
     encode_audio,
     encode_full_request,
+    extract_full_text,
     extract_text,
 )
 
@@ -141,6 +142,65 @@ class ExtractTextTests(unittest.TestCase):
     def test_no_result_returns_empty(self):
         text, is_final = extract_text({})
         self.assertEqual(text, "")
+        self.assertFalse(is_final)
+
+
+class ExtractFullTextTests(unittest.TestCase):
+    """extract_full_text concatenates *all* utterances, including ones
+    that have already been finalized and dropped from result.text. This
+    is the path that fixes "first half of long sentence vanished" — see
+    daemon.log captures of Doubao splitting at sentence pauses."""
+
+    def test_single_partial_utterance_falls_back_to_text(self):
+        payload = {"result": {"text": "你", "utterances": [
+            {"text": "你", "definite": False}
+        ]}}
+        full, is_final = extract_full_text(payload)
+        self.assertEqual(full, "你")
+        self.assertFalse(is_final)
+
+    def test_multiple_utterances_concatenated(self):
+        # Real-world shape captured from production: first sentence
+        # already definite, second still being recognized. result.text
+        # contains only the second one — extract_text would lose the
+        # first; extract_full_text must preserve both.
+        payload = {"result": {
+            "text": "呃，按照就是用户体验提升价值大小来排序",
+            "utterances": [
+                {"text": "这个产品如果做一些，嗯，你能提一些改进建议，"
+                         "尤其是那种能改进用户体验的建议的话，你会怎么提？",
+                 "definite": True},
+                {"text": "呃，按照就是用户体验提升价值大小来排序",
+                 "definite": False},
+            ],
+        }}
+        full, is_final = extract_full_text(payload)
+        self.assertEqual(
+            full,
+            "这个产品如果做一些，嗯，你能提一些改进建议，"
+            "尤其是那种能改进用户体验的建议的话，你会怎么提？"
+            "呃，按照就是用户体验提升价值大小来排序",
+        )
+        self.assertFalse(is_final)  # second utterance not yet definite
+
+    def test_all_definite_is_final(self):
+        payload = {"result": {"text": "", "utterances": [
+            {"text": "第一句。", "definite": True},
+            {"text": "第二句。", "definite": True},
+        ]}}
+        full, is_final = extract_full_text(payload)
+        self.assertEqual(full, "第一句。第二句。")
+        self.assertTrue(is_final)
+
+    def test_empty_utterances_falls_back_to_result_text(self):
+        payload = {"result": {"text": "孤立片段", "utterances": []}}
+        full, is_final = extract_full_text(payload)
+        self.assertEqual(full, "孤立片段")
+        self.assertFalse(is_final)
+
+    def test_no_result_returns_empty(self):
+        full, is_final = extract_full_text({})
+        self.assertEqual(full, "")
         self.assertFalse(is_final)
 
 

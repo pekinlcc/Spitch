@@ -246,34 +246,22 @@ class VoiceController:
             stream = live.stream(chunks_gen).__aiter__()
 
             async def _consume() -> bool:
-                """Drain events until cancel or end-of-stream. Return True iff a final fired.
+                """Drain events until cancel or end-of-stream.
 
-                Doubao splits long utterances at sentence boundaries.
-                Each segment is independently marked ``definite=true``,
-                and CRUCIALLY, after that point ``evt.text`` *resets* —
-                the next event's ``text`` field contains only the new
-                utterance, not the accumulated full transcript. So a
-                naïve "use the last evt.text on EOS" loses every
-                segment except the last one (this manifested as
-                "the front of my sentence got cut off").
+                Each ``evt.text`` is the **accumulated full transcript**
+                (built by :func:`extract_full_text` from every
+                ``utterances[].text``). We don't have to do segment
+                accumulation here — ``evt.text`` is already correct
+                across utterance boundaries.
 
-                The fix is to accumulate finalized segments into a
-                list and append the running (non-finalized) utterance
-                at session end:
-
-                    full = "".join(final_segments) + current_utterance
-
-                Every callback (partial / latest_text / final) reports
-                this accumulated value so tray labels and inject text
-                stay consistent across segment boundaries.
+                ``evt.is_final`` is True only after every utterance is
+                ``definite=true``, which the server emits after
+                receiving our EOS audio frame. Either way, we treat
+                stream EOF (sender finished + ws closed) as the
+                signal to commit, so even a truncated session can
+                paste the latest accumulated text.
                 """
-                final_segments: list[str] = []
-                current_text = ""
-                saw_any_final = False
-
-                def full_text() -> str:
-                    return "".join(final_segments) + current_text
-
+                last_text = ""
                 try:
                     while True:
                         try:
@@ -282,34 +270,18 @@ class VoiceController:
                             break
                         if self._cancel.is_set():
                             return False
-                        if not evt.text:
-                            continue
-                        if evt.is_final:
-                            # This utterance is now frozen — move it
-                            # to the segment list and reset the
-                            # running utterance for the next segment.
-                            saw_any_final = True
-                            final_segments.append(evt.text)
-                            current_text = ""
-                        else:
-                            current_text = evt.text
-                        # Keep latest_text + tray label aligned with
-                        # the cumulative full text, not the bare
-                        # current segment.
-                        self._latest_text = full_text()
-                        self._on_partial(self._latest_text)
-                    # Stream ended normally. Commit cumulative text
-                    # if we have anything to commit.
-                    commit = full_text()
-                    if commit and not self._cancel.is_set():
-                        self._on_final(commit)
+                        if evt.text:
+                            last_text = evt.text
+                            self._latest_text = evt.text
+                            self._on_partial(evt.text)
+                    # Stream ended normally — commit the accumulated text.
+                    if last_text and not self._cancel.is_set():
+                        self._on_final(last_text)
                         return True
                     return False
                 except Exception:
-                    if not self._cancel.is_set():
-                        commit = full_text() or self._latest_text
-                        if commit:
-                            self._on_final(commit)
+                    if not self._cancel.is_set() and (last_text or self._latest_text):
+                        self._on_final(last_text or self._latest_text)
                     raise
 
             consume_task: asyncio.Task | None = None

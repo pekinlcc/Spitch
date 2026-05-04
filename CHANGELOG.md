@@ -2,6 +2,47 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.6] — 2026-05-04
+
+**真正修好了**长句中段被截断的问题。0.4.5 走的方向对（不要在第一段 final 时退 session）但实现错——以为 server 会在段切换点发出 `is_final=True` 让我们 append 到 `final_segments`。
+
+### 真实抓到的现象（0.4.5 daemon log）
+
+```
+25,290 partial: …能改进用户体验的建议的话，你会怎么提？呃，按照就是用户体验提升价值大小来排序
+25,332 partial: …呃，按照就是用户体验提升价值大小来排序    ← reset，前半段消失
+…
+final:   '呃，按照就是用户体验提升价值大小来排序，不要提太多。'
+```
+
+豆包在段切换点发的 payload 是这样：
+
+```json
+{"result": {
+  "text": "呃，按照…",                    ← 只有当前段
+  "utterances": [
+    {"text": "…你会怎么提？", "definite": true},   ← 已 finalized
+    {"text": "呃，按照…",     "definite": false}   ← 当前正在生成
+  ]
+}}
+```
+
+`is_final = all(definite=true)` → False（第二段还没 definite）→ 0.4.5 把这个当普通 partial 处理 → `current_text` 被覆盖成第二段 → 第一段从此找不回。
+
+### 修复
+
+引入新函数 `extract_full_text(payload)`：直接拼接 `utterances[].text`（包括所有 definite 的 + 当前 in-progress 的），不依赖那个误导性的 `is_final` boolean。
+
+- `doubao.py:stream()` 改用 `extract_full_text` — 现在 `evt.text` 永远是从用户开始说到目前为止的**累积全文**
+- `controller.py:_consume()` 也大幅简化——既然 `evt.text` 已经是完整全文，就不需要 segment 累积逻辑了，直接 `last_text = evt.text`、stream 关闭时 commit
+- `extract_text()` 保留不变（向后兼容 + 单 utterance 快路径），但加了 docstring 警告它的 multi-utterance 缺陷
+
+### 测试
+
+93 个单元测试全部通过。新增 5 个 `ExtractFullTextTests`，包括用真实从 daemon.log 复制下来的 multi-utterance payload 验证累积正确。
+
+---
+
 ## [0.4.5] — 2026-05-04
 
 修复**长句中带停顿时只 inject 最后一段**的核心 bug。0.4.1 的修复方向（不在第一个 `definite=true` 退 session）是对的，但实现有缺陷——以为 server 给的 `result.text` 是累积全文，实际是**每段 utterance 独立**的。

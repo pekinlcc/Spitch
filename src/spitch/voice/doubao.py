@@ -291,20 +291,15 @@ def auth_headers(
 def extract_text(payload: dict) -> tuple[str, bool]:
     """Pull ``(text, is_final)`` out of a SERVER_FULL_RESPONSE / SERVER_ACK payload.
 
-    Doubao bigmodel responses look like::
+    .. warning:: This function returns ``result.text`` verbatim, which on
+       multi-utterance streams contains **only the current in-progress
+       utterance**. Once an utterance is marked ``definite=true``, it
+       disappears from ``result.text`` and only the next utterance is
+       reported there. For an accumulated full transcript across
+       utterance boundaries use :func:`extract_full_text`. ``extract_text``
+       is kept for the single-utterance fast path and for tests.
 
-        {
-          "result": {
-            "text": "你好世界",
-            "utterances": [{"text": "...", "definite": true, ...}, ...]
-          }
-        }
-
-    We treat the response as final when any utterance has ``definite=true``
-    *and* there are no later non-definite utterances, OR when the top-level
-    ``result.text`` is present and the connection is being closed by EOS
-    on the caller side. We return whatever text the server has so far
-    (preferring ``result.text``).
+    Treats the response as final when every utterance is ``definite=true``.
     """
     if not isinstance(payload, dict):
         return "", False
@@ -322,6 +317,61 @@ def extract_text(payload: dict) -> tuple[str, bool]:
             isinstance(u, dict) and u.get("definite") is True for u in utterances
         )
     return text, is_final
+
+
+def extract_full_text(payload: dict) -> tuple[str, bool]:
+    """Pull ``(full_text, is_final)`` reconstructing the **whole transcript**.
+
+    Doubao bigmodel responses look like::
+
+        {
+          "result": {
+            "text": "<current in-progress utterance>",
+            "utterances": [
+              {"text": "first sentence.", "definite": true, ...},
+              {"text": "second sentence still being recognized",
+               "definite": false, ...}
+            ]
+          }
+        }
+
+    Once an utterance is marked ``definite=true``, the server **drops it
+    from `result.text`**; only the in-progress utterance is reported
+    there. To rebuild the full transcript across utterance boundaries we
+    concatenate every ``utterances[].text`` (definite ones first in
+    chronological order, plus the current in-progress one).
+
+    Falls back to ``result.text`` when the ``utterances`` array is
+    missing or empty (single-utterance fast path / probe responses).
+
+    ``is_final`` is True iff every utterance is definite — that's the
+    server's "everything has been finalized" signal, which only fires
+    after the client sent the EOS audio frame (user released the talk
+    key).
+    """
+    if not isinstance(payload, dict):
+        return "", False
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return "", False
+    utterances = result.get("utterances") or []
+    if not isinstance(utterances, list) or not utterances:
+        # No utterance breakdown — fall back to result.text. is_final
+        # stays False because there's no definite=true marker to flip it.
+        text = result.get("text") or ""
+        return text if isinstance(text, str) else "", False
+    parts: list[str] = []
+    for u in utterances:
+        if not isinstance(u, dict):
+            continue
+        t = u.get("text", "")
+        if isinstance(t, str) and t:
+            parts.append(t)
+    full = "".join(parts)
+    is_final = all(
+        isinstance(u, dict) and u.get("definite") is True for u in utterances
+    )
+    return full, is_final
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +524,10 @@ class DoubaoClient:
                 if frame.message_type == SERVER_ERROR_RESPONSE:
                     raise DoubaoProtocolError(f"server error: {frame.payload!r}")
                 if isinstance(frame.payload, dict):
-                    text, is_final = extract_text(frame.payload)
+                    # extract_full_text concatenates every utterance —
+                    # critical for multi-utterance streams where
+                    # result.text alone drops already-finalized segments.
+                    text, is_final = extract_full_text(frame.payload)
                     yield TranscriptEvent(text=text, is_final=is_final, raw=frame.payload)
                     # Do NOT return on is_final. Doubao splits long
                     # utterances into multiple definite segments and
