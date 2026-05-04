@@ -140,6 +140,27 @@ class AudioCapture:
                 + (err_text or "no stderr output")
             )
 
+        # arecord is alive. Spawn a small daemon thread to drain stderr
+        # so a long recording doesn't get throttled by a full 64 KB
+        # pipe buffer if arecord ever writes a warning. With ``-q``
+        # this is rare but the cost is one trivial thread per session
+        # and the failure mode without it (stdout starves silently)
+        # would be diabolical to debug.
+        stderr_pipe = self._proc.stderr
+
+        def _drain_stderr() -> None:
+            try:
+                while stderr_pipe.read(4096):
+                    pass
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_drain_stderr,
+            name="spitch-arecord-stderr",
+            daemon=True,
+        ).start()
+
         def _reader_loop() -> None:
             assert self._proc is not None and self._proc.stdout is not None
             chunk = self.config.chunk_bytes

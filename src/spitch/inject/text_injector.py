@@ -186,13 +186,15 @@ def _send_paste_keystroke(spec: str = "Ctrl+Shift+V") -> Tuple[bool, str]:
         msg = f"cannot open /dev/uinput ({e}) — check ACL"
         log.error(msg)
         return False, msg
-    # Wait for udev → libinput → compositor to enumerate the new
-    # virtual keyboard into the seat. Without this delay the first few
-    # EV_KEY events can be dropped on fast machines and the paste
-    # silently does nothing — only a retry recovers. 30 ms is enough
-    # in practice on GNOME/KDE Wayland and X11.
-    time.sleep(0.03)
     try:
+        # Wait for udev → libinput → compositor to enumerate the new
+        # virtual keyboard into the seat. Without this delay the first
+        # few EV_KEY events can be dropped on fast machines and the
+        # paste silently does nothing — only a retry recovers. 30 ms
+        # is enough in practice on GNOME/KDE Wayland and X11. Kept
+        # inside the try so the finally always closes the device,
+        # even if a signal interrupts the sleep.
+        time.sleep(0.03)
         # Press modifiers, then main key, with small inter-event waits
         # so the compositor sees a clean chord rather than simultaneous
         # events that some focused apps drop.

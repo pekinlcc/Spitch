@@ -170,11 +170,15 @@ class SpitchDaemon:
         if not self._press_accepted:
             return
         self._press_accepted = False
-        # Capture the queue BEFORE release() — by the time the inject
-        # thread runs, a fast next-press may have replaced
-        # self._pending_final with a fresh queue.
+        # Capture the queue locally so a later, fast next-press that
+        # replaces self._pending_final with Q2 cannot redirect *our*
+        # inject thread to the wrong queue. Do NOT clear
+        # self._pending_final here — the worker may still be in
+        # FINALIZING and on_final fires by reading self._pending_final;
+        # if we'd nulled it the slow-final path would silently drop
+        # the transcript. The next accepted press is the only thing
+        # that legitimately replaces it.
         pending = self._pending_final
-        self._pending_final = None
         self._voice.release()
         threading.Thread(
             target=self._finalize_and_inject,
