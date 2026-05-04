@@ -55,9 +55,13 @@ class _FakeVoice:
 
 
 class _FakeQuiescentListener:
-    """Stand-in for HotkeyListener — the inject thread polls is_quiescent."""
+    """Stand-in for HotkeyListener — the inject thread blocks on
+    wait_quiescent() before synthesizing the paste keystroke."""
 
     def is_quiescent(self) -> bool:
+        return True
+
+    def wait_quiescent(self, timeout: float | None = None) -> bool:
         return True
 
 

@@ -93,8 +93,18 @@ class HotkeyListener:
     ):
         _init_codes()
         self._wanted = list(combo)
-        if not self._wanted:
-            raise ValueError("combo must contain at least one modifier")
+        if len(self._wanted) < 2:
+            # Single-modifier push-to-talk is unusable in practice:
+            # Ctrl / Alt / Shift / Super get pressed dozens of times per
+            # minute for system shortcuts and would each kick off a
+            # bogus recording. The CLI / config dialog enforces this
+            # too, but defend the constructor against programmatic
+            # callers that bypass that gate.
+            raise ValueError(
+                "combo must contain at least two distinct modifier keys "
+                "(got %r) — single-modifier hold is unusable as "
+                "push-to-talk" % self._wanted
+            )
         self._wanted_codes: set[int] = set().union(
             *(_MOD_KEYS[m] for m in self._wanted)
         )
@@ -105,6 +115,11 @@ class HotkeyListener:
         self._held: dict[str, bool] = {m: False for m in self._wanted}
         self._talk_active = False
         self._stop = threading.Event()
+        # Set whenever none of the wanted modifiers is currently held.
+        # Lets the inject thread block on Event.wait() instead of
+        # busy-polling is_quiescent().
+        self._quiescent_event = threading.Event()
+        self._quiescent_event.set()
         self._thread: threading.Thread | None = None
         self._devices: list = []
 
@@ -134,6 +149,17 @@ class HotkeyListener:
     def is_quiescent(self) -> bool:
         """True when none of the wanted modifiers is currently held."""
         return not any(self._held.values())
+
+    def wait_quiescent(self, timeout: float | None = None) -> bool:
+        """Block until all wanted modifiers are released.
+
+        Returns ``True`` if quiescence was observed within ``timeout``,
+        ``False`` if the timeout fired first. ``None`` waits forever.
+        Used by the inject thread instead of a busy-poll over
+        ``is_quiescent()`` so the daemon idle-burns 0% CPU between
+        releases.
+        """
+        return self._quiescent_event.wait(timeout=timeout)
 
     def _run(self) -> None:
         from evdev import ecodes as ec
@@ -169,6 +195,13 @@ class HotkeyListener:
                 self._held[wanted_mod] = True
             elif is_release:
                 self._held[wanted_mod] = False
+            # Maintain the quiescent event in lockstep with _held so a
+            # blocked wait_quiescent() returns the moment the user
+            # finishes releasing the chord.
+            if any(self._held.values()):
+                self._quiescent_event.clear()
+            else:
+                self._quiescent_event.set()
             all_held = all(self._held[m] for m in self._wanted)
             if all_held and not self._talk_active:
                 self._talk_active = True

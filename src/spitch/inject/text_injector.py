@@ -67,8 +67,9 @@ def _detect_backend() -> Optional[str]:
     return None
 
 
-def _copy(data: bytes) -> Tuple[bool, str]:
-    backend = _detect_backend()
+def _copy(data: bytes, backend: Optional[str] = None) -> Tuple[bool, str]:
+    if backend is None:
+        backend = _detect_backend()
     if backend is None:
         msg = "no clipboard helper found — install wl-clipboard (Wayland) or xclip/xsel (X11)"
         log.error(msg)
@@ -88,12 +89,13 @@ def _copy(data: bytes) -> Tuple[bool, str]:
         return False, msg
 
 
-def _paste() -> Optional[bytes]:
+def _paste(backend: Optional[str] = None) -> Optional[bytes]:
     """Read the current clipboard. Returns ``None`` if no helper is
     available or the call fails. Preserves trailing newlines so a
     save+restore round trip is byte-identical.
     """
-    backend = _detect_backend()
+    if backend is None:
+        backend = _detect_backend()
     if backend == "wayland":
         if not shutil.which("wl-paste"):
             return None
@@ -256,10 +258,19 @@ def inject_text(
     """
     if not text:
         return True, ""
-    saved = _paste() if restore_clipboard else None
+    # Detect once per inject. The previous implementation called
+    # _detect_backend() in each of _paste, _copy, and the restore _copy
+    # — three full PATH walks (shutil.which) for every transcript. The
+    # backend cannot change inside a single inject call, so cache it.
+    backend = _detect_backend()
+    if backend is None:
+        msg = "no clipboard helper found — install wl-clipboard (Wayland) or xclip/xsel (X11)"
+        log.error(msg)
+        return False, msg
+    saved = _paste(backend) if restore_clipboard else None
     clipboard_was_overwritten = False
     try:
-        ok, reason = _copy(text.encode("utf-8"))
+        ok, reason = _copy(text.encode("utf-8"), backend)
         if not ok:
             return False, reason
         clipboard_was_overwritten = True
@@ -275,6 +286,6 @@ def inject_text(
             # original clipboard back if our paste failed mid-way.
             time.sleep(max(0.0, restore_delay_ms / 1000.0))
             try:
-                _copy(saved)
+                _copy(saved, backend)
             except Exception:
                 pass

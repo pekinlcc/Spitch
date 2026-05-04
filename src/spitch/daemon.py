@@ -21,7 +21,6 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 from typing import Optional
 
 from .config import is_complete, is_verified, load_config
@@ -213,11 +212,11 @@ class SpitchDaemon:
         # Wait for the user to physically release all hotkey modifiers
         # before we synthesize Ctrl+V — otherwise the still-held Alt
         # would turn our paste into Ctrl+Alt+V (a different shortcut).
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            if self._listener and self._listener.is_quiescent():
-                break
-            time.sleep(0.02)
+        # The listener exposes an Event that flips on the release of
+        # the last modifier; blocking on it idle-burns 0% CPU between
+        # presses (the previous busy-poll spent 50 wakeups/s here).
+        if self._listener is not None:
+            self._listener.wait_quiescent(timeout=2.0)
         inject_cfg = self._cfg.get("inject") or {}
         keystroke = inject_cfg.get("paste_keystroke", "Ctrl+Shift+V")
         try:
@@ -260,6 +259,19 @@ class SpitchDaemon:
             print(
                 "spitch: invalid talk_key — set hotkey.talk_key to a "
                 "modifier-pair like 'Ctrl+Alt'",
+                file=sys.stderr,
+            )
+            return 2
+        if len(combo) < 2:
+            # Single-modifier hold is unusable: Ctrl/Alt/Shift/Super get
+            # pressed dozens of times per minute for system shortcuts
+            # and would each trigger a recording. Reject with a
+            # specific, fixable message rather than letting the daemon
+            # come up and behave erratically.
+            print(
+                f"spitch: hotkey.talk_key must combine two modifiers "
+                f"(got just '{combo[0]}'). Try 'Ctrl+Alt' or "
+                "'Ctrl+Shift'.",
                 file=sys.stderr,
             )
             return 2
