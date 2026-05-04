@@ -2,6 +2,26 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] — 2026-05-04
+
+托盘 UX 重做：把"录音中 / 转写中"的反馈从 Ubuntu 顶部弹的桌面通知 popup 搬进右上角 tray label，并加了 About 对话框看版本号。配置文件层面**完全向后兼容**——没有新增配置字段。
+
+### 新增
+
+- **tray label 实时显示识别片段**：录音时状态栏 tray 图标旁边出现 `🎙 你好世界今天…`，server 推 partial 就刷新一下，最长截到末尾 15 个字。FINALIZING 期间显示 `✍ <最新文本>`，会话结束后保留 1.5 秒 `✓ <识别结果>` 让用户看到最终结果再淡出。出错显示 `⚠ 出错`
+- **About Spitch 菜单项**：右键 tray → 第二个新菜单项，弹 `Gtk.AboutDialog`，显示 `spitch.__version__`、项目描述、网站、license、bundled 的 idle 图标作 logo。版本号唯一事实源就是 `__init__.py` 的 `__version__`
+
+### 修复
+
+- **录音/转写不再弹桌面通知 popup**：原本每次按下 / 松开都会从屏幕顶上弹两条系统通知，现在 tray label 直接承载状态反馈，安静且更易扫到
+- **headless 模式行为不变**：缺 AppIndicator 包或 D-Bus 不可达时（自动 fallback 到 headless），原来的 notify-send 通知保留，用户至少能看到反馈
+
+### 测试
+
+88 个单元测试全部通过。新增 12 个覆盖 `compose_label` / `_tail` 纯函数：每个 State + 有/无 partial 的标签格式、末尾截断的 ellipsis 行为、超长时保留尾部而非头部。
+
+---
+
 ## [0.3.0] — 2026-05-04
 
 修复了**前半截语音被吃掉**这个长期问题，并把第二轮代码审查（含一次自审）发现的 P0/P1 全部修完。配置文件层面**完全向后兼容**——新增字段都有默认值，老配置文件加载后自动获得它们；CLI 命令不变。
@@ -100,6 +120,7 @@
 - libayatana-appindicator 系统托盘
 - 配置原子写 + chmod 600 + 凭据指纹 verified gating
 
+[0.4.0]: https://github.com/pekinlcc/Spitch/releases/tag/v0.4.0
 [0.3.0]: https://github.com/pekinlcc/Spitch/releases/tag/v0.3.0
 [0.2.1]: https://github.com/pekinlcc/Spitch/releases/tag/v0.2.1
 [0.2.0]: https://github.com/pekinlcc/Spitch/releases/tag/v0.2.0
