@@ -33,7 +33,23 @@ def _state_log_path() -> Path:
     return Path(base) / "spitch" / "daemon.log"
 
 
+_TAB_INDEX = {"history": 0, "log": 1, "settings": 2}
+
+
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover - GUI
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="spitch-console",
+        description="Spitch 三 tab 控制台：历史 / 日志 / 设置",
+    )
+    parser.add_argument(
+        "--tab",
+        choices=list(_TAB_INDEX.keys()),
+        default="history",
+        help="启动时打开的 tab（默认: history）。.desktop 入口用 settings",
+    )
+    args = parser.parse_args(argv)
+
     try:
         import gi  # type: ignore
         gi.require_version("Gtk", "3.0")
@@ -50,6 +66,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - GUI
     win = Gtk.Window(title=f"Spitch — 控制台  v{__version__}")
     win.set_default_size(720, 480)
     win.set_border_width(8)
+    # Match the GNOME app icon set by the .desktop file so the
+    # window itself shows the spitch icon in alt-tab / overview.
+    try:
+        win.set_icon_name("spitch")
+    except Exception:
+        pass
 
     notebook = Gtk.Notebook()
     win.add(notebook)
@@ -62,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - GUI
 
     # ---- Settings tab -----------------------------------------------
     notebook.append_page(_build_settings_tab(Gtk, GLib), Gtk.Label(label="设置"))
+
+    notebook.set_current_page(_TAB_INDEX.get(args.tab, 0))
 
     win.connect("destroy", lambda _w: Gtk.main_quit())
     win.show_all()

@@ -97,6 +97,46 @@ chmod +x "$BIN_DIR/spitch-console"
 
 info "installed $BIN_DIR/{spitch-daemon, spitch-config, spitch-cli, spitch-console}"
 
+# 2.5. desktop entry + icon — so Spitch shows up in the application
+# menu / activities overview, with an icon, opening the console
+# directly to the settings tab. We install per-user (no sudo); the
+# .desktop file references Icon=spitch which resolves through
+# hicolor → ~/.local/share/icons/hicolor/scalable/apps/spitch.svg.
+ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+mkdir -p "$ICON_DIR" "$DESKTOP_DIR"
+
+ICON_SRC="$REPO/data/icons/spitch.svg"
+if [ -f "$ICON_SRC" ]; then
+    cp "$ICON_SRC" "$ICON_DIR/spitch.svg"
+else
+    # Fallback to the bundled tray icon — same artwork.
+    cp "$REPO/src/spitch/tray/icons/spitch-idle.svg" "$ICON_DIR/spitch.svg"
+fi
+
+# Render the .desktop template — substitute the absolute path of the
+# launcher we just generated. Avoids relying on $PATH at app-menu
+# launch time (some DEs spawn .desktop entries with a minimal env).
+DESKTOP_IN="$REPO/data/spitch.desktop.in"
+if [ -f "$DESKTOP_IN" ]; then
+    sed "s|@BIN_DIR@|$BIN_DIR|g" "$DESKTOP_IN" > "$DESKTOP_DIR/spitch.desktop"
+    chmod +x "$DESKTOP_DIR/spitch.desktop"  # GNOME wants executable
+fi
+
+# Best-effort cache refresh so GNOME / KDE / Cinnamon pick up the
+# new icon + desktop file without a logout. Both commands are no-ops
+# on most modern stacks (file-watching does the work) — failure is
+# harmless.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q "$DESKTOP_DIR" 2>/dev/null || true
+fi
+
+info "installed application launcher (icon + .desktop) — open"
+info "  Activities / 应用程序 → search 'Spitch' or '语音输入'"
+
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) info "warning: $BIN_DIR is not on \$PATH — add it to ~/.bashrc:"

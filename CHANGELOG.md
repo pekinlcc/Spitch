@@ -2,6 +2,31 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.5.2] — 2026-05-05
+
+应用菜单 launcher——装完之后 Spitch 会出现在 GNOME Activities / KDE 应用程序菜单里，带图标，点击直接打开控制台的"设置" tab。之前需要终端跑 `spitch-console`，对非命令行用户不友好。
+
+### 新增
+
+- **`data/spitch.desktop.in` 模板**：标准 freedesktop.org `.desktop` 文件。中英双语 `Name` / `GenericName` / `Comment` / `Keywords`（支持搜"Spitch"、"语音输入"、"听写"、"voice"、"dictation"等）。`Categories=Utility;Audio;AudioVideo;` 让它在分类菜单里也能找到。
+- **`spitch-console --tab {history,log,settings}` 参数**：默认 `history`（终端跑保持原有行为）；`.desktop` 文件指定 `--tab settings`，从应用菜单点开就直接看到设置面板（开机自动启动 checkbox + 各项可调参数）。
+- **`install.sh` 自动装 launcher**：
+  - 图标 → `~/.local/share/icons/hicolor/scalable/apps/spitch.svg`
+  - .desktop → `~/.local/share/applications/spitch.desktop`（绝对路径替换占位符，避免 DE 启动时 `$PATH` 不全）
+  - 触发 `gtk-update-icon-cache` + `update-desktop-database` 让 GNOME / KDE / Cinnamon 立即看到，无需 logout
+- **窗口图标绑定**：`spitch-console` 调 `Gtk.Window.set_icon_name("spitch")`，alt-tab / overview 都显示一致的图标
+- **`uninstall.sh` 同步清理** .desktop + icon + 触发数据库刷新
+
+### 测试
+
+141 个单元测试全部通过（与 v0.5.1 相同——本次改动是打包 / UI 入口，不需要新测试）。
+
+### 兼容性
+
+无破坏。已经手动用过 `spitch-console`（无 `--tab`）的用户不受影响。重新跑 `./scripts/install.sh` 会幂等安装新的图标 + .desktop。
+
+---
+
 ## [0.5.1] — 2026-05-04
 
 控制台设置 tab 加了"开机自动启动 daemon"的 checkbox——把 `docs/INSTALL.md` 里手动的 `systemctl --user enable` 那一节做成图形界面。

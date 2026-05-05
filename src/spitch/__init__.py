@@ -10,4 +10,4 @@ Wayland and X11 alike, regardless of whether IBus, fcitx5, or no IM is
 configured.
 """
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"

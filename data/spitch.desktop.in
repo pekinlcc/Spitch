@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Spitch
+Name[zh_CN]=Spitch 语音输入
+GenericName=Voice Input
+GenericName[zh_CN]=语音输入设置
+Comment=Global-hotkey voice input — hold Ctrl+Alt to dictate
+Comment[zh_CN]=全局热键中文语音输入 — 按住 Ctrl+Alt 说话
+Exec=@BIN_DIR@/spitch-console --tab settings
+Icon=spitch
+Terminal=false
+Categories=Utility;Audio;AudioVideo;
+StartupNotify=true
+Keywords=voice;dictation;speech;asr;mic;
+Keywords[zh_CN]=语音;听写;输入;语音输入;识别;
