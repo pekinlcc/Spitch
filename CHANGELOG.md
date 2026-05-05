@@ -2,6 +2,37 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.5.1] — 2026-05-04
+
+控制台设置 tab 加了"开机自动启动 daemon"的 checkbox——把 `docs/INSTALL.md` 里手动的 `systemctl --user enable` 那一节做成图形界面。
+
+### 新增
+
+- **`spitch.autostart` 模块**：封装 systemd user unit 的写入 / `daemon-reload` / `enable --now` / `disable --now` 逻辑。提供 4 个函数：
+  - `is_supported()` — 这台机器有没有可用的 systemd `--user` 实例（非 systemd 发行版返回 False，控制台据此把 checkbox 灰掉 + 显示 tooltip）
+  - `is_enabled()` — 当前是不是 enabled
+  - `enable()` / `disable()` — 切换状态，返回 `(ok, 中文 message)` 给 UI 直接展示
+  - 单元文件位置：`~/.config/systemd/user/spitch.service`，由 Spitch 拥有，可随时手动编辑或 `disable --now` 后删除
+- **控制台设置 tab 的 "开机自动启动 daemon" checkbox**：
+  - 启动时显示当前实际状态
+  - toggle 失败时（如缺 input 组、launcher 不存在）自动回滚到真实状态，并在状态行显示具体错误
+  - 重入保护：错误回滚时 `set_active()` 不会再次触发 handler
+
+### 测试
+
+141 个单元测试全部通过（v0.5.0 是 123 个）。新增 `tests/test_autostart.py`：18 个测试，覆盖 unit 文件渲染（必含 sections / 绝对路径 / graphical-session.target / Restart=on-failure）、XDG path 解析、`systemctl` 不存在 / 超时 / user bus offline 各种 fallback、enable / disable 的 idempotent 性质（mock subprocess.run 不依赖真实 systemctl）。
+
+### 兼容性
+
+无破坏性变更。已经手动跑过 `systemctl --user enable spitch.service` 的用户：checkbox 启动时会自动反映"已启用"状态；下次 toggle 也直接 work（unit 文件会被重写为新内容，`After=graphical-session.target` 等内容跟手动版本完全一致）。
+
+### 注意
+
+- Auto-start 跑起来后**仍然要求用户在 `input` 组**（读 `/dev/input/event*`）。日志里会出现 `no readable keyboard devices` 错误。如果遇到，先 `sudo usermod -aG input $USER` 然后重登。
+- 非 systemd 发行版（Devuan / Alpine OpenRC 等）不支持，checkbox 会自动灰掉。
+
+---
+
 ## [0.5.0] — 2026-05-04
 
 **控制台 / 历史 / 重粘**——把 daemon 从"只能按住说话"扩成"还能管理已识别的内容"。本版前所有失败的转写（被截断、注入到错应用、识别错）都只能再说一遍；从 v0.5 起每段都进历史，托盘 / 命令行 / GTK 三种方式都能补救。

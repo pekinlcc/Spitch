@@ -386,6 +386,24 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         e_final_wait.set_value(5)
     add_row(4, "等 final 最长秒数", e_final_wait)
 
+    # --- Auto-start checkbox ----------------------------------------
+    # Talks to the user-level systemd unit. Hidden when systemctl
+    # --user isn't a thing on this host (non-systemd distros).
+    from .. import autostart as _autostart  # local import keeps top light
+    autostart_supported = _autostart.is_supported()
+    cb_autostart = Gtk.CheckButton(label="开机自动启动 daemon (systemd --user)")
+    cb_autostart.set_sensitive(autostart_supported)
+    if autostart_supported:
+        try:
+            cb_autostart.set_active(_autostart.is_enabled())
+        except Exception:
+            cb_autostart.set_active(False)
+    else:
+        cb_autostart.set_tooltip_text(
+            "这台机器没有可用的 systemd --user 实例，无法自动启动"
+        )
+    grid.attach(cb_autostart, 0, 5, 3, 1)
+
     info = Gtk.Label(
         label=(
             f"配置文件：{config_path()}\n"
@@ -432,6 +450,42 @@ def _build_settings_tab(Gtk, GLib):  # pragma: no cover
         else:
             status.set_text("spitch-config 不在 PATH 上，参考 docs/INSTALL.md")
 
+    # Re-entrancy guard: programmatic set_active() during error
+    # rollback would otherwise re-fire the handler.
+    autostart_busy = {"v": False}
+
+    def on_autostart_toggled(btn):
+        if autostart_busy["v"]:
+            return
+        if not autostart_supported:
+            return
+        want_enabled = btn.get_active()
+        autostart_busy["v"] = True
+        try:
+            if want_enabled:
+                ok, msg = _autostart.enable()
+            else:
+                ok, msg = _autostart.disable()
+        finally:
+            autostart_busy["v"] = False
+        if ok:
+            status.set_text(("✓ " if ok else "⚠ ") + msg)
+        else:
+            # Roll the checkbox back to the actual state so the user
+            # doesn't see "checked" while the unit's not really enabled.
+            actual = False
+            try:
+                actual = _autostart.is_enabled()
+            except Exception:
+                pass
+            autostart_busy["v"] = True
+            try:
+                btn.set_active(actual)
+            finally:
+                autostart_busy["v"] = False
+            status.set_text("⚠ " + msg)
+
+    cb_autostart.connect("toggled", on_autostart_toggled)
     btn_save.connect("clicked", on_save)
     btn_open_config.connect("clicked", on_open_config)
     return box
