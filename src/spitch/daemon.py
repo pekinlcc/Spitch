@@ -42,6 +42,38 @@ from .voice import (
 log = logging.getLogger("spitch.daemon")
 
 
+class _WebsocketsAttributeErrorFilter(logging.Filter):
+    """Suppress a known noisy traceback from the websockets library.
+
+    On a server-side connection reset during a session, websockets'
+    ``Connection.connection_lost`` callback can run before its
+    ``recv_messages`` attribute has been initialized, producing:
+
+        AttributeError: 'ClientConnection' object has no attribute 'recv_messages'
+
+    The exception is harmless — the underlying ``ConnectionResetError``
+    is already propagated to our session loop and surfaces as a normal
+    ``voice error: ConnectionResetError`` warning. The traceback just
+    pollutes daemon.log with five lines of irrelevant stack. Filter it
+    out so the log stays useful for actual debugging.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        msg = record.getMessage()
+        if "Connection.connection_lost" in msg and "recv_messages" in (
+            record.exc_text or msg
+        ):
+            return False
+        if record.exc_info and record.exc_info[1] is not None:
+            exc = record.exc_info[1]
+            if (
+                isinstance(exc, AttributeError)
+                and "recv_messages" in str(exc)
+            ):
+                return False
+        return True
+
+
 def _active_window_label() -> str:
     """Best-effort label for the currently-focused window. Used as a
     metadata tag in history entries — the user looking at history
@@ -623,6 +655,12 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="[%(asctime)s %(name)s %(levelname)s] %(message)s",
     )
+    # Quiet a known-noisy traceback from the websockets library that
+    # fires on server-side connection resets. The underlying error is
+    # already surfaced through our own voice-error path.
+    _ws_filter = _WebsocketsAttributeErrorFilter()
+    logging.getLogger("asyncio").addFilter(_ws_filter)
+    logging.getLogger("websockets").addFilter(_ws_filter)
     cfg = load_config()
     return SpitchDaemon(cfg).run()
 

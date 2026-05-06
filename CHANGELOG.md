@@ -2,6 +2,43 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.5.3] — 2026-05-05
+
+针对网络延迟 / 抖动场景做了一套优化。设计原则：**录音永远不阻塞、网络不好就重试和等待、用户接受异步 inject**——按住时不管网络通不通都先录下来，网络好了再发，server 慢就多等一会儿，"按完了过几秒文字自然出现"也是可接受的体验。
+
+### 核心症状（v0.5.2 实测）
+
+- 按住说话 → 没有 partial 流式输出（说明 server 没收到 audio）
+- 松手 → tray 显示"转写中"
+- 5 秒后 → "no final transcript within 5.0s" + tray 卡在"⚠ 出错"
+- 触发链：刚连上 WiFi 那 1-2 分钟里，第一次 ws connect 被 server reset，第二次 ws TLS 握手 5 秒超时，daemon 没机会重试
+
+### 修复
+
+- **WS 连接自动重试**：`DoubaoClient.__aenter__` 里加 backoff 序列 `(0, 1s, 3s, 6s)`——单次 connect 失败时最多重试 3 次，**总等待 10 秒**。`OSError / TimeoutError / ConnectionError` 都触发重试；只有 auth/protocol 错误（`InvalidHandshake`）才立即抛。
+- **`final_wait_seconds` 默认 5 → 30 秒**：松手后给 server 30 秒返回 final，覆盖 ws 重试 + audio 上传 + server 处理的总耗时。在好网络下不影响用户体验（partial/final 几百毫秒就到），在差网络下不会因为 5 秒过严而错杀。
+- **音频缓冲 128 → 600 chunks（12 秒 → 60 秒）**：按住说话期间如果 ws 还没连上，audio chunks 累积在内存 ring buffer 里。原来 12 秒就溢出导致 chunks 被丢；现在 60 秒——足以覆盖 ws 重试 backoff 期间任何长度的说话。
+- **ERROR 状态 30 秒后自动回 IDLE**：tray label 不会一直顶着"⚠ 出错"让用户误以为还坏。`controller._set_state` 进 ERROR 时启动一个 `threading.Timer`，30 秒内没新事件就自动 flip 回 IDLE。任何状态转换（press / 自然结束）都取消 timer。`error_idle_timeout` 构造参数可调（设 0 关掉这个行为）。
+- **过滤 websockets 库的 `recv_messages` AttributeError 噪音**：上游 [websockets v15 bug](https://github.com/python-websockets/websockets) — 在某些 server-reset 时机里 `Connection.connection_lost` 会拿不到 `recv_messages` 属性。这个异常**对功能无影响**（真正的 `ConnectionResetError` 我们已经正确处理），只是日志里多 5 行 traceback 干扰诊断。daemon main() 装一个 `logging.Filter` 把它过滤掉。
+
+### 用户可感知的体验差异
+
+```
+之前：按住说话 → 没反应 → 松手 → "转写中" → 5s 后 "出错" → 用户重说一遍
+现在：按住说话 → ws 自动重试 → audio 缓冲累积 → 松手 → "转写中…" →
+      最长 30s 内文字自动出现 → 即使切到别的窗口去做事都不打断
+```
+
+### 测试
+
+141 个单元测试全部通过。本次主要是常量调整 + retry 循环 + 一个 Timer——无需新测试覆盖（现有的 controller / doubao 测试覆盖了 happy path）。
+
+### 兼容性
+
+无破坏性变更。已经手动改过 `inject.final_wait_seconds=5` 的用户保留旧值；其他用户自动获得 30s 新默认。
+
+---
+
 ## [0.5.2] — 2026-05-05
 
 应用菜单 launcher——装完之后 Spitch 会出现在 GNOME Activities / KDE 应用程序菜单里，带图标，点击直接打开控制台的"设置" tab。之前需要终端跑 `spitch-console`，对非命令行用户不友好。

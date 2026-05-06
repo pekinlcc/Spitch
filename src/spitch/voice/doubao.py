@@ -419,7 +419,16 @@ class DoubaoClient:
         self._sample_rate = sample_rate
         self._ws = None  # populated in __aenter__
 
+    # WS connect retry — covers transient network blips (just connected
+    # to wifi, captive portal handshake, server-side TCP reset). Total
+    # wall time before giving up: 1+3+6 = 10s of backoff plus the
+    # connect attempts themselves. The audio capture is independent of
+    # this loop, so the user keeps recording while we retry — anything
+    # said during the 10s gets queued and shipped once we're connected.
+    _CONNECT_BACKOFF_S = (0.0, 1.0, 3.0, 6.0)
+
     async def __aenter__(self) -> "DoubaoClient":
+        import asyncio
         try:
             import websockets  # local import — optional dep
         except ImportError as exc:
@@ -427,18 +436,36 @@ class DoubaoClient:
                 "websockets package required for live Doubao calls; "
                 "install it via pip install websockets"
             ) from exc
-        self._ws = await websockets.connect(
-            self._creds.endpoint,
-            additional_headers=list(
-                auth_headers(
-                    app_key=self._creds.app_key,
-                    access_key=self._creds.access_key,
-                    resource_id=self._creds.resource_id,
-                ).items()
-            ),
-            max_size=None,
-        )
-        return self
+        last_exc: BaseException | None = None
+        for attempt, delay in enumerate(self._CONNECT_BACKOFF_S):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                self._ws = await websockets.connect(
+                    self._creds.endpoint,
+                    additional_headers=list(
+                        auth_headers(
+                            app_key=self._creds.app_key,
+                            access_key=self._creds.access_key,
+                            resource_id=self._creds.resource_id,
+                        ).items()
+                    ),
+                    max_size=None,
+                )
+                return self
+            except (OSError, TimeoutError, asyncio.TimeoutError,
+                    ConnectionError) as exc:
+                last_exc = exc
+                # Retry transient network errors. Auth / protocol errors
+                # surface as websockets.InvalidHandshake and bubble out
+                # immediately — no point retrying those.
+                if attempt + 1 < len(self._CONNECT_BACKOFF_S):
+                    continue
+                raise
+        # Unreachable, but keep the type checker happy.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("connect retry loop exited without attempt")
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if self._ws is not None:

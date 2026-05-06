@@ -75,6 +75,7 @@ class VoiceController:
         on_state: Callable[[State], None] | None = None,
         finalize_timeout: float = 2.0,
         audio_config: AudioConfig | None = None,
+        error_idle_timeout: float = 30.0,
     ):
         self._client_factory = client_factory
         self._audio = audio or AudioCapture(audio_config)
@@ -83,12 +84,20 @@ class VoiceController:
         self._on_error = on_error or (lambda _e: None)
         self._on_state = on_state or (lambda _s: None)
         self._finalize_timeout = finalize_timeout
+        # How long ERROR can sit before we silently flip it back to IDLE
+        # so the tray label stops shouting "出错" after a transient
+        # network blip is long since over. The next press is also
+        # accepted while in ERROR, so this is purely cosmetic — but
+        # the cosmetic difference matters: a stuck "出错" badge makes
+        # users think the app is still broken when it isn't.
+        self._error_idle_timeout = error_idle_timeout
 
         self._state = State.IDLE
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._latest_text = ""
         self._worker: threading.Thread | None = None
+        self._error_recovery_timer: threading.Timer | None = None
 
     # -- introspection -------------------------------------------------
 
@@ -166,10 +175,33 @@ class VoiceController:
 
     def _set_state(self, s: State) -> None:
         self._state = s
+        # Manage the ERROR-idle recovery timer in lockstep with state
+        # transitions. Any transition out of ERROR cancels a pending
+        # timer; entering ERROR (re-)arms one.
+        if self._error_recovery_timer is not None:
+            try:
+                self._error_recovery_timer.cancel()
+            except Exception:
+                pass
+            self._error_recovery_timer = None
+        if s == State.ERROR and self._error_idle_timeout > 0:
+            self._error_recovery_timer = threading.Timer(
+                self._error_idle_timeout, self._recover_from_error,
+            )
+            self._error_recovery_timer.daemon = True
+            self._error_recovery_timer.start()
         try:
             self._on_state(s)
         except Exception:
             pass
+
+    def _recover_from_error(self) -> None:
+        """Fired by the error-idle timer. Flip ERROR → IDLE if nothing
+        else has moved the state in the meantime."""
+        with self._lock:
+            if self._state != State.ERROR:
+                return
+            self._set_state(State.IDLE)
 
     def _audio_iter(self) -> Iterator[bytes]:
         """PCM iterator that yields until capture stops or cancel fires."""

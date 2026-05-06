@@ -65,6 +65,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # ever paste into traditional GTK/Qt apps that read the
         # clipboard synchronously.
         "restore_clipboard_delay_ms": 800,
+        # How long to wait for the server's final transcript after
+        # the user releases the talk key. With a flaky network this
+        # may be longer than feels intuitive: ws connect retries
+        # alone can eat 10 s of backoff, then the audio still has
+        # to go out and the server has to respond. 30 s is generous
+        # enough that "released the key, waited a bit, text appeared"
+        # works even on bad wifi without forcing the user to redo
+        # the dictation. Set lower if you want failures to surface
+        # faster instead of waiting it out.
+        "final_wait_seconds": 30.0,
     },
     "verified_at": None,
     "verified_signature": None,

@@ -344,5 +344,74 @@ class VoiceControllerTests(unittest.TestCase):
         self.assertEqual(finals, ["你能听见吗？好的，再见。"])
 
 
+class ErrorRecoveryTests(unittest.TestCase):
+    """ERROR state should auto-flip back to IDLE after a brief idle
+    period so the tray label stops asserting "出错" long after a
+    transient network blip is over."""
+
+    def test_error_auto_recovers_to_idle(self):
+        events: list[State] = []
+
+        # Force an error path: client_factory raises during press()'s
+        # session_coro. We don't need a real ws.
+
+        class BadClient:
+            async def __aenter__(self):
+                raise RuntimeError("simulated network failure")
+
+            async def __aexit__(self, *_):
+                return None
+
+            def stream(self, _audio_iter):
+                async def _empty():
+                    if False:
+                        yield None
+                return _empty()
+
+        ctrl = VoiceController(
+            client_factory=lambda: BadClient(),
+            audio=FakeAudio([b"\x00" * 32]),
+            on_state=events.append,
+            error_idle_timeout=0.2,  # short for the test
+        )
+        ctrl.press()
+        # Wait for the error to propagate.
+        deadline = time.time() + 2.0
+        while time.time() < deadline and ctrl.state != State.ERROR:
+            time.sleep(0.01)
+        self.assertEqual(ctrl.state, State.ERROR)
+        # The recovery timer should flip us back within ~200 ms.
+        deadline = time.time() + 1.5
+        while time.time() < deadline and ctrl.state != State.IDLE:
+            time.sleep(0.01)
+        self.assertEqual(ctrl.state, State.IDLE)
+        # Sanity: the on_state stream must include both the ERROR and
+        # the auto-recovery IDLE transitions.
+        self.assertIn(State.ERROR, events)
+        self.assertEqual(events[-1], State.IDLE)
+
+    def test_state_transition_cancels_pending_recovery_timer(self):
+        # Any state transition out of ERROR must cancel the pending
+        # recovery timer — otherwise the timer would later flip a
+        # live RECORDING / FINALIZING back to IDLE.
+        events: list[State] = []
+        ctrl = VoiceController(
+            client_factory=lambda: None,
+            audio=FakeAudio([]),
+            on_state=events.append,
+            error_idle_timeout=0.1,
+        )
+        # Drive the state machine directly (don't go through press()
+        # to avoid a real session being spun up). We bypass the
+        # public API on purpose — this is a private-state correctness
+        # test.
+        ctrl._set_state(State.ERROR)   # arms the recovery timer
+        ctrl._set_state(State.RECORDING)  # must cancel it
+        # Wait past the timer interval to confirm it didn't fire.
+        time.sleep(0.3)
+        # Should see ERROR + RECORDING. NO timer-driven IDLE.
+        self.assertEqual(events, [State.ERROR, State.RECORDING])
+
+
 if __name__ == "__main__":
     unittest.main()

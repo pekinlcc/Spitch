@@ -107,7 +107,15 @@ class AudioCapture:
             maxlen=self.config.prebuffer_chunks,
         )
         # The session output. ``chunks()`` reads from here.
-        self._session_queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=128)
+        # 600 chunks × 100 ms = 60 s of audio buffer. The previous
+        # 128-slot bound (~12.8 s) caused silent drops when the WS
+        # connect took longer than that — partials would never come
+        # because the head of the utterance had been thrown away
+        # while we were still negotiating TLS. 60 s comfortably
+        # covers the 10 s of connect-retry backoff plus a typical
+        # hold duration without leaking memory (max ~4 MB at
+        # 16 kHz mono int16).
+        self._session_queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=600)
         self._session_active = False
         # Single short-held lock guarding _prebuffer + _session_active +
         # _session_queue mutations. The audio backend callback
