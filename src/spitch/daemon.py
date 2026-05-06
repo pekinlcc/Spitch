@@ -267,7 +267,27 @@ class SpitchDaemon:
         self._pending_final = new_pending
         self._press_accepted = True
         self._press_started_at = time.time()
-        log.info("press: session started (state=%s)", self._voice.state)
+        # Snapshot audio backend health so a "no partial ever arrived"
+        # bug report can be attributed to the right layer (mic stream
+        # vs. server) instead of guessing.
+        prebuf_n = "?"
+        last_chunk_age = "?"
+        if self._audio is not None:
+            try:
+                prebuf_n = str(len(self._audio._prebuffer))  # type: ignore[attr-defined]
+                if self._audio._last_chunk_at:  # type: ignore[attr-defined]
+                    last_chunk_age = "%.2fs" % (
+                        time.monotonic() - self._audio._last_chunk_at  # type: ignore[attr-defined]
+                    )
+                else:
+                    last_chunk_age = "never"
+            except Exception:
+                pass
+        log.info(
+            "press: session started (state=%s, prebuf=%s chunks, "
+            "last_chunk=%s ago)",
+            self._voice.state, prebuf_n, last_chunk_age,
+        )
 
     def _on_release(self) -> None:
         if self._voice is None:

@@ -2,6 +2,45 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.5.4] — 2026-05-06
+
+修复"按下后 ws 连得上但 server 没回任何 partial / final"——是 v0.5.3 优化网络抖动场景之后又冒出来的另一类故障。
+
+### 根因
+
+PipeWire / PulseAudio 在客户端 idle 时会**静悄悄地 suspend** 输入 stream——sounddevice 的 callback 完全停止 firing。daemon 这边 `_mic_open=True`、`_stream` 对象还在，但**没有任何 audio chunk 流进来**。按下时：
+
+1. `audio.start()` 把 prebuffer snapshot 进 session_queue ← prebuffer 是空的或全是几十分钟前的旧数据
+2. 用户说话 ← _on_audio 不被调用，session_queue 不再加新内容
+3. ws connect 成功，sender 立刻 drain 完空 queue → 发 EOS
+4. server 看到一个空 audio session + EOS，直接关 ws
+5. **没有任何 partial / final** → 30 秒 timeout
+
+实测日志特征（v0.5.3）：
+```
+press: session started (state=State.RECORDING)
+session: connected, starting stream    ← ws OK
+release: voice.state=State.RECORDING, scheduling inject  ← 用户说了 17s
+WARNING: no final transcript within 30.0s   ← 完全静默
+```
+
+### 修复
+
+- **`AudioCapture._last_chunk_at` 时间戳**：每次 `_on_audio()` 收到 chunk 都更新。在 daemon press 日志里也打出来，方便诊断（`prebuf=N chunks, last_chunk=X.XXs ago`）。
+- **`_is_backend_stale()` 检测**：超过 2 秒没收到 chunk 就视为 stream 已被 OS 音频服务 suspend。
+- **`_recycle_backend()` 自动重建**：`AudioCapture.start()` 检测到 stale 时自动 close + reopen sounddevice / arecord。重开后等最多 150ms 让第一个 chunk 进 prebuffer，避免 snapshot 时还是空的。
+- 整个流程对用户透明——按下 Ctrl+Alt 时如果背景 stream 已经被 suspend，daemon 自动重建一次（额外 50–500ms），然后正常录音。比之前的"按了没反应"体验好很多。
+
+### 测试
+
+143 个单元测试全部通过（v0.5.3 是 141）。新增 2 个 audio backend stale 检测测试。
+
+### 兼容性
+
+无破坏性变更。本来 backend 没有 stall 的设备（比如 stream 一直在用、或者用 arecord 的）行为不变。
+
+---
+
 ## [0.5.3] — 2026-05-05
 
 针对网络延迟 / 抖动场景做了一套优化。设计原则：**录音永远不阻塞、网络不好就重试和等待、用户接受异步 inject**——按住时不管网络通不通都先录下来，网络好了再发，server 慢就多等一会儿，"按完了过几秒文字自然出现"也是可接受的体验。

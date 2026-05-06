@@ -130,6 +130,13 @@ class AudioCapture:
         self._stop_event = threading.Event()
         self._mic_open = False
         self._backend: str | None = None
+        # Last time we received an audio chunk from the backend, in
+        # ``time.monotonic()`` units. 0.0 = never. Used by
+        # :meth:`start` to detect a stale stream — PipeWire /
+        # PulseAudio may suspend the input device after long idle
+        # stretches, in which case the callback simply stops firing
+        # and prebuffer goes empty/old. We catch that and re-open.
+        self._last_chunk_at: float = 0.0
 
     # ------------------------------------------------------------------
     # internal: a single callback the backends route into
@@ -146,6 +153,7 @@ class AudioCapture:
             return
         with self._lock:
             self._prebuffer.append(chunk)
+            self._last_chunk_at = time.monotonic()
             if self._session_active:
                 try:
                     self._session_queue.put_nowait(chunk)
@@ -337,6 +345,44 @@ class AudioCapture:
     # ------------------------------------------------------------------
     # public API: session lifecycle
 
+    # Treat the backend as stale if we haven't received a single
+    # chunk in this many seconds. PipeWire / PulseAudio will silently
+    # suspend an idle input client and stop firing the callback; the
+    # symptom from the user is "press Ctrl+Alt, server connects, no
+    # partial ever arrives, 30 s timeout". Re-opening the backend is
+    # cheap (50–500 ms) and recovers cleanly.
+    _STALE_AFTER_S = 2.0
+
+    def _is_backend_stale(self) -> bool:
+        """True when the backend is supposedly open but not delivering.
+
+        Returns False before the very first chunk has been received
+        (we haven't proven it's working yet, but we also haven't
+        proven it's broken — give it a chance). Once we've seen at
+        least one chunk, "no chunk for N seconds" is a reliable
+        suspended-stream signal.
+        """
+        if not self._mic_open:
+            return False
+        if self._last_chunk_at == 0.0:
+            return False
+        return (time.monotonic() - self._last_chunk_at) > self._STALE_AFTER_S
+
+    def _recycle_backend(self) -> str:
+        """Close + reopen the audio backend. Used when start() detects
+        the stream has gone silent (PipeWire suspend, etc.). We do this
+        with the lock dropped because close()/open() can take a few
+        hundred ms each and we don't want to block live audio callbacks
+        on the still-attached old stream during the swap."""
+        # Tear down the old, possibly dead backend.
+        try:
+            self.close()
+        except Exception:
+            pass
+        # close() resets _mic_open so the next call opens fresh.
+        self._last_chunk_at = 0.0
+        return self._open_backend()
+
     def start(self) -> str:
         """Begin a new session.
 
@@ -346,10 +392,28 @@ class AudioCapture:
         demand (legacy behavior; means the first session pays the
         backend-startup latency).
 
+        Also recycles the backend when it's been silent for too long —
+        catches the PipeWire-suspended-after-idle case where the
+        callback has stopped firing and the prebuffer no longer
+        reflects real audio.
+
         Returns the backend name actually in use.
         """
         if not self._mic_open:
             self._open_backend()
+        elif self._is_backend_stale():
+            # Stream went silent — almost certainly suspended by the
+            # OS audio server after a long idle period. Re-open.
+            self._recycle_backend()
+            # Give the new stream a brief moment to push a chunk so
+            # the prebuffer isn't dead-empty when we snapshot it.
+            # Without this, the very first session after a recycle
+            # might send only the EOS frame and Doubao would close
+            # the WS without any partials.
+            for _ in range(15):  # up to ~150 ms total
+                if self._last_chunk_at != 0.0:
+                    break
+                time.sleep(0.01)
         with self._lock:
             # Drain any leftover sentinels / late chunks from a
             # previous session.
