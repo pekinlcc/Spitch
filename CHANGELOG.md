@@ -2,6 +2,61 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.5.5] — 2026-05-08
+
+修复"短录音 / 急促松手时丢后半截"。
+
+### 实测证据（v0.5.4 daemon log）
+
+```
+11:07:24  press
+11:07:27  release  ← 3.5 秒说话
+final: '你是不是要帮我重新'   ← 句子明显断在中间
+
+12:19:11  press
+12:19:15  release  ← 3.95 秒
+final: '你直接把'             ← 又是断点
+```
+
+10 秒以上的长录音都完整 ✓；短录音 / 用户说完最后一个字立刻松手的场景，最后那段话经常没识别完就被截掉。
+
+### 根因（两个叠加）
+
+1. **sounddevice 在 stream.stop() 时丢 trailing partial chunk** —— callback 还没 fire 的最后那 ~100 ms audio 永远不会进 prebuffer
+2. **server 收到 EOS 立即 finalize** —— 那段还在路上 / 还在识别中的 audio 没机会被识别完
+
+短录音里这两个时间窗口都很紧，丢字概率高；长录音里 server 已经识别了大部分，最后一两个字截不截无所谓。
+
+### 修复：松手后 linger 300 ms 再触发 audio.stop
+
+`daemon._on_release` 现在不立即调 `voice.release()`，而是 schedule 一个 `threading.Timer(0.3, voice.release)`：
+
+- 这 300 ms 里录音还在走，sounddevice 把 trailing partial chunk 完整 fire 出来 → 进 prebuffer → 进 session_queue
+- 这 300 ms 里 audio chunks 持续上传，server 持续识别
+- 300 ms 后再正式触发 `voice.release()` → audio.stop → EOS → server 已经把最后那段都识别完了
+
+可配置：`audio.release_linger_ms`（默认 300，设 0 关掉，跟 0.5.4 行为一致）。
+
+### Race 处理
+
+- **快速 release → press**：用户松手后立即又按下（300 ms 内），新 press 同步刷掉 pending linger Timer，调一次 voice.release()，让 controller 干净地 RECORDING→FINALIZING→IDLE 完成上一个 session 后再进新 session。否则 controller 状态机会错乱。
+- **`Timer.cancel()` 返回值**：踩了一个坑——`Timer.cancel()` 返回 None（不是 bool）。改用 `is_alive()` 判断 timer 是否还活着、需不需要补一次同步 release。
+
+### 测试
+
+145 个单元测试全部通过（v0.5.4 是 143）。新增 2 个：
+- `test_release_linger_delays_voice_release`：验证 linger=80ms 时 release 调用确实被推迟
+- `test_press_during_linger_flushes_pending_release`：验证 race 路径——press 同步刷掉 pending linger
+
+### 兼容性
+
+无破坏。`audio.release_linger_ms` 在老 config 里缺失自动取默认 300。如果你**不希望**有这 300ms 延迟（比如对每次粘贴的延迟敏感），手动改成 0：
+```json
+"audio": { "release_linger_ms": 0 }
+```
+
+---
+
 ## [0.5.4] — 2026-05-06
 
 修复"按下后 ws 连得上但 server 没回任何 partial / final"——是 v0.5.3 优化网络抖动场景之后又冒出来的另一类故障。

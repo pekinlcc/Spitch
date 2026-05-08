@@ -168,6 +168,11 @@ class SpitchDaemon:
         # was accepted so we can record the recording duration in
         # the history entry.
         self._press_started_at: float = 0.0
+        # Pending Timer that delays the call to voice.release() so
+        # the trailing 300 ms of audio actually make it to the server
+        # before EOS. Cancelled / fired-immediately when the user
+        # presses again before the linger expires.
+        self._linger_timer: Optional[threading.Timer] = None
 
     def _build_voice(self) -> VoiceController:
         d = self._cfg["doubao"]
@@ -251,10 +256,47 @@ class SpitchDaemon:
 
     # -- hotkey callbacks ---------------------------------------------
 
+    def _cancel_pending_linger(self) -> None:
+        """Fire a still-pending release-linger Timer immediately, if any.
+
+        Called before starting a new session so the controller has a
+        clean RECORDING→FINALIZING→IDLE transition for the previous
+        press before the new one arrives.
+        """
+        t = self._linger_timer
+        self._linger_timer = None
+        if t is None:
+            return
+        # ``Timer.cancel()`` returns None and is a no-op once the
+        # timer has already fired. We use ``is_alive()`` to decide
+        # whether we still need to do the work the timer was going
+        # to do — if it's alive, it hasn't fired yet, and we must
+        # call voice.release() ourselves now so the previous
+        # session's audio doesn't keep flowing into the next one.
+        was_alive = False
+        try:
+            was_alive = t.is_alive()
+        except Exception:
+            was_alive = False
+        try:
+            t.cancel()
+        except Exception:
+            pass
+        if was_alive and self._voice is not None:
+            try:
+                self._voice.release()
+            except Exception:
+                log.exception("flushing pending linger release failed")
+
     def _on_press(self) -> None:
         if self._voice is None:
             _notify("Spitch", "Not configured — run spitch-config")
             return
+        # If the previous press is still in its release-linger window,
+        # fire it now so the controller can transition to IDLE before
+        # we ask it to start fresh.
+        if self._linger_timer is not None:
+            self._cancel_pending_linger()
         # Only swap _pending_final after press() actually accepts —
         # otherwise a press during FINALIZING (rejected by the state
         # machine) would replace the previous session's queue and
@@ -302,7 +344,28 @@ class SpitchDaemon:
             log.info("release: ignored (no accepted press)")
             return
         self._press_accepted = False
-        log.info("release: voice.state=%s, scheduling inject", self._voice.state)
+        # Read the configured release-linger. Two failure modes this
+        # guards against, both observed live:
+        #   1. sounddevice drops the trailing partial-blocksize chunk
+        #      on stream.stop() — the last ~100 ms of audio never
+        #      reaches the callback at all.
+        #   2. the server finalizes the transcript the instant it
+        #      sees the EOS frame, even if the very last words are
+        #      still being recognized; short utterances get
+        #      truncated mid-sentence.
+        # Lingering 300 ms before we tell the controller to release
+        # captures a few more chunks AND lets the server's
+        # recognizer finish processing the tail before EOS arrives.
+        try:
+            linger_ms = int(
+                (self._cfg.get("audio") or {}).get("release_linger_ms", 300)
+            )
+        except (TypeError, ValueError):
+            linger_ms = 300
+        log.info(
+            "release: voice.state=%s, scheduling inject (linger=%dms)",
+            self._voice.state, linger_ms,
+        )
         # Capture the queue locally so a later, fast next-press that
         # replaces self._pending_final with Q2 cannot redirect *our*
         # inject thread to the wrong queue. Do NOT clear
@@ -312,7 +375,18 @@ class SpitchDaemon:
         # the transcript. The next accepted press is the only thing
         # that legitimately replaces it.
         pending = self._pending_final
-        self._voice.release()
+        if linger_ms > 0:
+            # If a prior linger Timer is still pending (very fast
+            # release-press-release sequence), let it fire first so
+            # we don't leave the controller in a weird mid-state.
+            self._cancel_pending_linger()
+            self._linger_timer = threading.Timer(
+                linger_ms / 1000.0, self._voice.release,
+            )
+            self._linger_timer.daemon = True
+            self._linger_timer.start()
+        else:
+            self._voice.release()
         threading.Thread(
             target=self._finalize_and_inject,
             args=(pending,),

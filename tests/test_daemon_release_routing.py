@@ -65,9 +65,16 @@ class _FakeQuiescentListener:
         return True
 
 
-def _build_daemon() -> SpitchDaemon:
+def _build_daemon(release_linger_ms: int = 0) -> SpitchDaemon:
+    """Build a SpitchDaemon for routing-logic tests.
+
+    Default ``release_linger_ms=0`` so tests of the synchronous
+    release → voice.release() path don't have to wait on a Timer.
+    Pass a positive value to exercise the linger-Timer code path.
+    """
     cfg = {
         "doubao": {"app_key": "x", "access_key": "y"},
+        "audio": {"release_linger_ms": release_linger_ms},
         "inject": {
             "paste_keystroke": "Ctrl+V",
             "final_wait_seconds": 0.5,
@@ -175,6 +182,49 @@ class ReleaseRoutingTests(unittest.TestCase):
             daemon._on_release()
             self.assertEqual(daemon._voice.release_calls, 0)
             inject_mock.assert_not_called()
+
+    def test_release_linger_delays_voice_release(self):
+        """v0.5.5: short utterances were truncating mid-sentence
+        because EOS landed at the server before the trailing audio
+        finished being recognized. _on_release now schedules
+        voice.release() through a Timer so the server has the full
+        last-300ms of audio before EOS arrives."""
+        daemon = _build_daemon(release_linger_ms=80)
+        daemon._voice = _FakeVoice(accept_press=True)
+
+        with patch("spitch.daemon.inject_text") as inject_mock:
+            daemon._on_press()
+            daemon._on_release()
+            # Linger Timer hasn't fired yet — voice.release() must
+            # not have been called.
+            self.assertEqual(daemon._voice.release_calls, 0)
+            self.assertIsNotNone(daemon._linger_timer)
+            # Wait past the linger window. release_calls must hit 1.
+            self.assertTrue(_wait_until(
+                lambda: daemon._voice.release_calls == 1, timeout=1.0,
+            ))
+            inject_mock.assert_not_called()  # no on_final, no inject
+
+    def test_press_during_linger_flushes_pending_release(self):
+        """v0.5.5 race: user releases, then *immediately* presses
+        again before the 300ms linger Timer fires. The new press
+        must flush the pending release synchronously so the
+        controller sees a clean RECORDING→FINALIZING→IDLE on the
+        previous session before the new press calls press()."""
+        daemon = _build_daemon(release_linger_ms=10000)  # very slow linger
+        daemon._voice = _FakeVoice(accept_press=True)
+
+        with patch("spitch.daemon.inject_text"):
+            daemon._on_press()
+            daemon._on_release()
+            self.assertEqual(daemon._voice.release_calls, 0)
+            self.assertIsNotNone(daemon._linger_timer)
+            # Now press again while the previous linger is still pending.
+            daemon._on_press()
+            # The pending linger should have been flushed synchronously
+            # — release_calls hits 1 BEFORE the second press's recording.
+            self.assertGreaterEqual(daemon._voice.release_calls, 1)
+            self.assertIsNone(daemon._linger_timer)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # "open mic on press, close on release" behavior — gives back
         # the always-on-mic but loses the head of every utterance.
         "prebuffer_ms": 500,
+        # How long to keep recording after the user releases the talk
+        # key, before we send the EOS frame to the server. Two reasons
+        # this is non-zero by default:
+        #   1. sounddevice drops the trailing partial blocksize when
+        #      its stream is stopped — the last ~100 ms of speech is
+        #      gone before it ever leaves the callback.
+        #   2. the server finalizes immediately on EOS; if the last
+        #      few hundred ms of audio are still in flight (or the
+        #      server is still processing), those words don't get
+        #      recognized in time and the final transcript truncates
+        #      mid-sentence.
+        # 300 ms is enough to capture the trailing word + give the
+        # server time to finish recognizing it. The user barely feels
+        # this since they're already waiting for the inject to land.
+        # Set to 0 to disable (matches pre-0.5.5 behavior).
+        "release_linger_ms": 300,
     },
     "hotkey": {
         "talk_key": "Ctrl+Alt",
