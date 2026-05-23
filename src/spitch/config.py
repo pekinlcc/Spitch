@@ -61,6 +61,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "hotkey": {
         "talk_key": "Ctrl+Alt",
+        # v0.6: optional second hotkey that routes the transcript to
+        # the salmon event bus instead of the focused-app paste path.
+        # An external subscriber (the Salmon Overlay window) consumes
+        # the events via ``cmdsock subscribe``. Set to ``""`` to
+        # disable. Single-modifier holds are allowed here because the
+        # caller is a single specific consumer, not arbitrary apps —
+        # the system-shortcut conflict the talk_key gate guards
+        # against doesn't apply.
+        "salmon_key": "Super",
     },
     "inject": {
         # Synthetic keystroke used to paste the final transcript into the

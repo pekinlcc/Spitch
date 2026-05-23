@@ -22,10 +22,11 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .cmdsock import CmdServer, default_socket_path
 from .config import is_complete, is_verified, load_config
+from .eventbus import EventBus
 from .history import HistoryEntry, HistoryRing, default_history_path
 from .hotkey import HotkeyListener, parse_combo
 from .inject import inject_text
@@ -173,6 +174,16 @@ class SpitchDaemon:
         # before EOS. Cancelled / fired-immediately when the user
         # presses again before the linger expires.
         self._linger_timer: Optional[threading.Timer] = None
+        # v0.6: salmon-mode hotkey. Set when an active press came from
+        # the salmon hotkey (Super by default) instead of the paste
+        # hotkey (Ctrl+Alt). Drives the routing in _on_partial /
+        # _on_final: paste sessions feed inject_text, salmon sessions
+        # publish events on _bus and DON'T touch the clipboard at all.
+        self._salmon_listener: Optional[HotkeyListener] = None
+        self._active_source: str = ""  # "" | "paste" | "salmon"
+        self._bus = EventBus()
+        # Used to compute session_end.duration_s for salmon mode.
+        self._salmon_session_started_at: float = 0.0
 
     def _build_voice(self) -> VoiceController:
         d = self._cfg["doubao"]
@@ -208,6 +219,15 @@ class SpitchDaemon:
     def _on_partial(self, text: str) -> None:
         if text:
             log.info("partial: …%s", text[-40:])
+        # Salmon-mode partial → fan out to subscribers and stop here.
+        # Don't echo into the tray label (the salmon overlay owns the
+        # user-visible feedback for this hotkey) and don't queue for
+        # inject (no paste path for salmon).
+        if self._active_source == "salmon":
+            self._bus.publish({
+                "evt": "partial", "source": "salmon", "text": text,
+            })
+            return
         # Stream partials into the tray label so the user sees what
         # the server is recognizing in real time. Cheap — the
         # indicator coalesces via GLib.idle_add and only the latest
@@ -217,6 +237,11 @@ class SpitchDaemon:
 
     def _on_final(self, text: str) -> None:
         log.info("final: %r", text)
+        if self._active_source == "salmon":
+            self._bus.publish({
+                "evt": "final", "source": "salmon", "text": text,
+            })
+            return
         # on_final fires from inside the controller's session, which means
         # the corresponding _on_press has already run and self._pending_final
         # still references this session's queue (the next press only happens
@@ -236,6 +261,14 @@ class SpitchDaemon:
 
     def _on_error(self, exc: BaseException) -> None:
         log.warning("voice error: %s", exc)
+        if self._active_source == "salmon":
+            self._bus.publish({
+                "evt": "error", "source": "salmon",
+                "message": f"{type(exc).__name__}: {exc}",
+            })
+            # Don't pop a desktop notify for salmon sessions — the
+            # overlay shows its own error chip.
+            return
         _notify("Spitch — error", str(exc)[:120])
 
     def _on_state(self, s: State) -> None:
@@ -306,6 +339,9 @@ class SpitchDaemon:
         if not self._voice.press():
             log.info("press: voice not idle (state=%s)", self._voice.state)
             return
+        # Tag this session so _on_partial / _on_final route to the
+        # paste path (clipboard + uinput) rather than the salmon bus.
+        self._active_source = "paste"
         self._pending_final = new_pending
         self._press_accepted = True
         self._press_started_at = time.time()
@@ -405,7 +441,87 @@ class SpitchDaemon:
         # "no final transcript" warning 5 seconds later.
         self._press_accepted = False
         self._pending_final = None
+        self._active_source = ""
         log.info("cancelled (third key during chord)")
+
+    # -- salmon-mode hotkey callbacks ---------------------------------
+    #
+    # Routes the transcript to subscribers on the cmdsock instead of
+    # the focused-app paste path. Same voice controller, separate
+    # accounting (no _pending_final, no inject thread).
+
+    def _on_salmon_press(self) -> None:
+        if self._voice is None:
+            return
+        if self._linger_timer is not None:
+            self._cancel_pending_linger()
+        if not self._voice.press():
+            log.info("salmon press: voice not idle (state=%s)", self._voice.state)
+            return
+        self._active_source = "salmon"
+        self._press_accepted = True
+        self._salmon_session_started_at = time.time()
+        log.info("salmon press: subscribers=%d", self._bus.subscriber_count())
+        self._bus.publish({
+            "evt": "session_start", "source": "salmon",
+            "ts": self._salmon_session_started_at,
+        })
+
+    def _on_salmon_release(self) -> None:
+        if self._voice is None:
+            return
+        if not self._press_accepted or self._active_source != "salmon":
+            return
+        self._press_accepted = False
+        try:
+            linger_ms = int(
+                (self._cfg.get("audio") or {}).get("release_linger_ms", 300)
+            )
+        except (TypeError, ValueError):
+            linger_ms = 300
+        if linger_ms > 0:
+            self._cancel_pending_linger()
+            self._linger_timer = threading.Timer(
+                linger_ms / 1000.0, self._voice.release,
+            )
+            self._linger_timer.daemon = True
+            self._linger_timer.start()
+        else:
+            self._voice.release()
+        # Schedule the session_end publish for after the final has
+        # had a chance to fire. Sleep for the same wall-clock budget
+        # the paste path waits in _finalize_and_inject so subscribers
+        # see {session_start, partial*, final, session_end} in order.
+        duration = max(0.0, time.time() - self._salmon_session_started_at)
+
+        def _emit_end():
+            time.sleep(self._finalize_timeout)
+            self._bus.publish({
+                "evt": "session_end", "source": "salmon",
+                "duration_s": duration,
+            })
+            # Clear the active source last so any straggling on_final
+            # still routes to salmon (the voice controller occasionally
+            # emits a slow final outside the linger window).
+            if self._active_source == "salmon":
+                self._active_source = ""
+
+        threading.Thread(
+            target=_emit_end, name="spitch-salmon-end", daemon=True,
+        ).start()
+
+    def _on_salmon_cancel(self) -> None:
+        if self._voice is None:
+            return
+        if self._active_source != "salmon":
+            return
+        self._voice.cancel()
+        self._press_accepted = False
+        was_active = self._active_source == "salmon"
+        self._active_source = ""
+        if was_active:
+            self._bus.publish({"evt": "session_cancel", "source": "salmon"})
+        log.info("salmon cancelled (third key during chord)")
 
     # -- finalize+inject ----------------------------------------------
 
@@ -514,6 +630,31 @@ class SpitchDaemon:
         self._history.clear()
         return {"ok": True}
 
+    def _cmd_subscribe(self, req: dict, send: Callable, wait_close: Callable) -> None:
+        """Streaming cmdsock handler — bridge an event bus subscription
+        to the requesting socket.
+
+        The client sends ``{"op":"subscribe","filter":"salmon"}``; we
+        reply with an ack (handled by the cmdsock layer), then attach
+        a sink that forwards every matching event over the socket as
+        a JSON line. We block in ``wait_close()`` until the client
+        closes its side, then detach. EventBus drops sinks whose
+        callable raises (typical for a closed socket), so a flaky
+        client gets cleaned up even without an explicit close.
+        """
+        wanted = req.get("filter")  # None == everything
+
+        def _sink(event: dict) -> None:
+            if wanted and event.get("source") != wanted:
+                return
+            send(event)
+
+        self._bus.subscribe(_sink)
+        try:
+            wait_close()
+        finally:
+            self._bus.unsubscribe(_sink)
+
     # -- main loop ----------------------------------------------------
 
     def run(self) -> int:
@@ -565,6 +706,29 @@ class SpitchDaemon:
         except RuntimeError as exc:
             print(f"spitch: {exc}", file=sys.stderr)
             return 3
+        # v0.6: optional second hotkey routes the transcript to the
+        # salmon event bus instead of pasting. Default is "Super"
+        # (single-modifier holds are opted in via allow_single_mod).
+        # Setting hotkey.salmon_key to "" disables salmon mode.
+        salmon_spec = (self._cfg.get("hotkey") or {}).get("salmon_key", "")
+        salmon_combo = parse_combo(salmon_spec) if salmon_spec else []
+        if salmon_combo:
+            try:
+                self._salmon_listener = HotkeyListener(
+                    salmon_combo,
+                    on_press=self._on_salmon_press,
+                    on_release=self._on_salmon_release,
+                    on_cancel=self._on_salmon_cancel,
+                    allow_single_mod=True,
+                )
+                self._salmon_listener.start()
+                log.info(
+                    "salmon-mode hotkey: hold %s (events on cmdsock subscribe)",
+                    "+".join(salmon_combo),
+                )
+            except (RuntimeError, ValueError) as exc:
+                log.warning("could not start salmon hotkey listener: %s", exc)
+                self._salmon_listener = None
         # Pre-open the mic so the very first press doesn't pay the
         # 50–500 ms backend warm-up latency that otherwise eats the
         # head of the user's first utterance. With prebuffer_ms == 0
@@ -609,6 +773,9 @@ class SpitchDaemon:
                     "delete_history": self._cmd_delete_history,  # alias
                     "clear":          self._cmd_clear_history,
                     "clear_history":  self._cmd_clear_history,  # alias
+                },
+                stream_handlers={
+                    "subscribe":      self._cmd_subscribe,
                 },
                 path=default_socket_path(),
             )
@@ -735,6 +902,11 @@ class SpitchDaemon:
         if self._listener is not None:
             try:
                 self._listener.stop()
+            except Exception:
+                pass
+        if self._salmon_listener is not None:
+            try:
+                self._salmon_listener.stop()
             except Exception:
                 pass
         if self._audio is not None:

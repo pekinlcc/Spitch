@@ -90,20 +90,23 @@ class HotkeyListener:
         on_press: Callable[[], None],
         on_release: Callable[[], None],
         on_cancel: Callable[[], None] | None = None,
+        allow_single_mod: bool = False,
     ):
         _init_codes()
         self._wanted = list(combo)
-        if len(self._wanted) < 2:
-            # Single-modifier push-to-talk is unusable in practice:
-            # Ctrl / Alt / Shift / Super get pressed dozens of times per
+        if len(self._wanted) < 2 and not allow_single_mod:
+            # Single-modifier push-to-talk is normally unusable: Ctrl
+            # / Alt / Shift / Super get pressed dozens of times per
             # minute for system shortcuts and would each kick off a
-            # bogus recording. The CLI / config dialog enforces this
-            # too, but defend the constructor against programmatic
-            # callers that bypass that gate.
+            # bogus recording. ``allow_single_mod=True`` opts into it
+            # for the salmon-mode subscriber, which routes the
+            # transcript to a dedicated app (the overlay) instead of
+            # pasting into whichever window happens to be focused —
+            # the conflict the gate guards against doesn't apply.
             raise ValueError(
                 "combo must contain at least two distinct modifier keys "
-                "(got %r) — single-modifier hold is unusable as "
-                "push-to-talk" % self._wanted
+                "(got %r) — pass allow_single_mod=True to opt into a "
+                "single-modifier hold" % self._wanted
             )
         self._wanted_codes: set[int] = set().union(
             *(_MOD_KEYS[m] for m in self._wanted)

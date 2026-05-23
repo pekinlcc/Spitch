@@ -22,6 +22,16 @@ Commands the daemon handles:
   * ``{"op": "clear"}`` → wipe history.
   * ``{"op": "reload_config"}`` → re-read ``config.json`` (rebuild the
     voice controller without restarting the daemon process).
+  * ``{"op": "subscribe", "filter": "salmon"}`` → upgrade this
+    connection to a long-lived event stream. The daemon writes one
+    JSON line per emitted event (``session_start`` / ``partial`` /
+    ``final`` / ``session_end`` / ``error``). The connection stays
+    open until the client closes it; closing unsubscribes cleanly.
+    ``filter`` is optional and matched against ``event["source"]``
+    on the daemon side — ``"salmon"`` is currently the only routed
+    source. Used by the Salmon Overlay window to subscribe to
+    salmon-mode hotkey transcripts without going through the paste
+    path.
 
 Error responses use ``{"ok": false, "error": "<msg>"}``. The cli /
 console treats anything else as a transient failure.
@@ -65,14 +75,27 @@ class CmdServer:
     the request payload (dict) and returns either a JSON-serializable
     dict (to be wrapped as the response) or raises an exception (which
     becomes ``{"ok": false, "error": "<repr>"}``).
+
+    Streaming ops (currently just ``subscribe``) take over the
+    connection instead of replying once. Pass them via
+    ``stream_handlers={"subscribe": handler}``; the handler signature
+    is ``(req: dict, send: Callable[[dict], None], wait_close: Callable[[], None]) -> None``
+    where ``send`` writes one JSON line back to the client and
+    ``wait_close`` blocks until the client disconnects (so the handler
+    can cleanly unsubscribe before returning).
     """
 
     def __init__(
         self,
         handlers: dict[str, Callable[[dict], dict]],
         path: Path | None = None,
+        stream_handlers: dict[
+            str,
+            Callable[[dict, Callable[[dict], None], Callable[[], None]], None],
+        ] | None = None,
     ):
         self._handlers = dict(handlers)
+        self._stream_handlers = dict(stream_handlers or {})
         self._path = path or default_socket_path()
         self._server: socketserver.UnixStreamServer | None = None
         self._thread: threading.Thread | None = None
@@ -92,6 +115,7 @@ class CmdServer:
         except OSError:
             pass
         handlers = self._handlers
+        stream_handlers = self._stream_handlers
 
         class _Handler(socketserver.StreamRequestHandler):
             def handle(self_inner) -> None:
@@ -114,6 +138,41 @@ class CmdServer:
                         )
                         return
                     op = req.get("op")
+                    stream = stream_handlers.get(op)
+                    if stream is not None:
+                        # Streaming op — keep the connection open, write
+                        # ack first, then hand control to the handler
+                        # which will publish events until the client
+                        # closes its side.
+                        write_lock = threading.Lock()
+
+                        def _send(event: dict) -> None:
+                            line = json.dumps(event, ensure_ascii=False) + "\n"
+                            with write_lock:
+                                self_inner.wfile.write(line.encode("utf-8"))
+                                self_inner.wfile.flush()
+
+                        def _wait_close() -> None:
+                            # Block until the client closes its half.
+                            # readline returns b"" on EOF; any unexpected
+                            # data is silently consumed since stream ops
+                            # are one-way after ack.
+                            try:
+                                while self_inner.rfile.readline():
+                                    pass
+                            except (OSError, ValueError):
+                                pass
+
+                        try:
+                            _send({"ok": True, "subscribed": True})
+                        except Exception:
+                            log.exception("stream ack failed")
+                            return
+                        try:
+                            stream(req, _send, _wait_close)
+                        except Exception:
+                            log.exception("stream handler %r raised", op)
+                        return
                     handler = handlers.get(op)
                     if handler is None:
                         self_inner.wfile.write(
@@ -135,7 +194,18 @@ class CmdServer:
                 except Exception:
                     log.exception("cmdsock dispatch failed")
 
-        self._server = socketserver.UnixStreamServer(
+        # ThreadingMixIn so a long-lived ``subscribe`` connection does
+        # NOT block one-shot RPCs like ping / list / repaste. Each
+        # request runs in its own short-lived thread; the daemon
+        # already spawns its own threads for inject + voice work so
+        # adding a per-request thread here costs almost nothing.
+        class _ThreadingServer(
+            socketserver.ThreadingMixIn, socketserver.UnixStreamServer
+        ):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        self._server = _ThreadingServer(
             str(self._path), _Handler, bind_and_activate=False
         )
         # bind ourselves so we can chmod 600 BEFORE accepting (avoid
