@@ -184,6 +184,8 @@ class SpitchDaemon:
         self._bus = EventBus()
         # Used to compute session_end.duration_s for salmon mode.
         self._salmon_session_started_at: float = 0.0
+        # Watchdog Timer for the stuck-recording guard in salmon mode.
+        self._salmon_watchdog: Optional[threading.Timer] = None
 
     def _build_voice(self) -> VoiceController:
         d = self._cfg["doubao"]
@@ -272,6 +274,22 @@ class SpitchDaemon:
         _notify("Spitch — error", str(exc)[:120])
 
     def _on_state(self, s: State) -> None:
+        # Salmon-mode subscribers want to know when a session has
+        # fully wound down so they can dismiss the recording UI and
+        # promote the buffered transcript into a topic. The voice
+        # controller fires IDLE once the EOS has flushed and the
+        # final has been delivered — that's the right moment to
+        # emit session_end (instead of the 30s-after-release sleep
+        # that the v0.6 patch originally used and which left the
+        # overlay listening forever when Doubao never gave a final).
+        if s == State.IDLE and self._active_source == "salmon":
+            duration = max(0.0, time.time() - self._salmon_session_started_at)
+            self._bus.publish({
+                "evt": "session_end", "source": "salmon",
+                "duration_s": duration,
+            })
+            log.info("salmon session_end (duration=%.1fs)", duration)
+            self._active_source = ""
         if self._indicator is not None:
             # Tray icon + label provide all the state feedback the
             # user needs; suppress the desktop notification popups
@@ -450,6 +468,13 @@ class SpitchDaemon:
     # the focused-app paste path. Same voice controller, separate
     # accounting (no _pending_final, no inject thread).
 
+    # Max wall-clock a salmon-mode session is allowed to keep the
+    # voice controller in RECORDING. Hard ceiling against a stuck
+    # session — if the user's evdev release went missing (we've seen
+    # it under specific Wayland focus changes) we forcibly release
+    # here rather than leaving the mic open and Doubao streaming.
+    _SALMON_RECORDING_WATCHDOG_S = 60.0
+
     def _on_salmon_press(self) -> None:
         if self._voice is None:
             return
@@ -466,13 +491,25 @@ class SpitchDaemon:
             "evt": "session_start", "source": "salmon",
             "ts": self._salmon_session_started_at,
         })
+        # Watchdog — see _SALMON_RECORDING_WATCHDOG_S.
+        self._cancel_salmon_watchdog()
+        self._salmon_watchdog = threading.Timer(
+            self._SALMON_RECORDING_WATCHDOG_S, self._salmon_watchdog_fire,
+        )
+        self._salmon_watchdog.daemon = True
+        self._salmon_watchdog.start()
 
     def _on_salmon_release(self) -> None:
         if self._voice is None:
             return
+        log.info(
+            "salmon release: voice.state=%s press_accepted=%s active_source=%s",
+            self._voice.state, self._press_accepted, self._active_source,
+        )
         if not self._press_accepted or self._active_source != "salmon":
             return
         self._press_accepted = False
+        self._cancel_salmon_watchdog()
         try:
             linger_ms = int(
                 (self._cfg.get("audio") or {}).get("release_linger_ms", 300)
@@ -488,40 +525,47 @@ class SpitchDaemon:
             self._linger_timer.start()
         else:
             self._voice.release()
-        # Schedule the session_end publish for after the final has
-        # had a chance to fire. Sleep for the same wall-clock budget
-        # the paste path waits in _finalize_and_inject so subscribers
-        # see {session_start, partial*, final, session_end} in order.
-        duration = max(0.0, time.time() - self._salmon_session_started_at)
-
-        def _emit_end():
-            time.sleep(self._finalize_timeout)
-            self._bus.publish({
-                "evt": "session_end", "source": "salmon",
-                "duration_s": duration,
-            })
-            # Clear the active source last so any straggling on_final
-            # still routes to salmon (the voice controller occasionally
-            # emits a slow final outside the linger window).
-            if self._active_source == "salmon":
-                self._active_source = ""
-
-        threading.Thread(
-            target=_emit_end, name="spitch-salmon-end", daemon=True,
-        ).start()
+        # session_end is published by _on_state(IDLE) once the voice
+        # controller has fully drained the EOS frame and delivered
+        # any final from the server. Subscribers see a clean
+        # {session_start, partial*, final?, session_end} sequence.
 
     def _on_salmon_cancel(self) -> None:
         if self._voice is None:
             return
         if self._active_source != "salmon":
             return
+        log.info("salmon cancelled (third key during chord)")
         self._voice.cancel()
         self._press_accepted = False
-        was_active = self._active_source == "salmon"
+        self._cancel_salmon_watchdog()
         self._active_source = ""
-        if was_active:
-            self._bus.publish({"evt": "session_cancel", "source": "salmon"})
-        log.info("salmon cancelled (third key during chord)")
+        self._bus.publish({"evt": "session_cancel", "source": "salmon"})
+
+    def _cancel_salmon_watchdog(self) -> None:
+        t = getattr(self, "_salmon_watchdog", None)
+        if t is None:
+            return
+        try:
+            t.cancel()
+        except Exception:
+            pass
+        self._salmon_watchdog = None
+
+    def _salmon_watchdog_fire(self) -> None:
+        if self._active_source != "salmon" or self._voice is None:
+            return
+        if self._voice.state != State.RECORDING:
+            return
+        log.warning(
+            "salmon watchdog: voice still RECORDING after %.0fs — forcing release",
+            self._SALMON_RECORDING_WATCHDOG_S,
+        )
+        try:
+            self._voice.release()
+        except Exception:
+            log.exception("watchdog release failed")
+        self._press_accepted = False
 
     # -- finalize+inject ----------------------------------------------
 
