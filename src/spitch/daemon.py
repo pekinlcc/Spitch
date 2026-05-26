@@ -186,6 +186,13 @@ class SpitchDaemon:
         self._salmon_session_started_at: float = 0.0
         # Watchdog Timer for the stuck-recording guard in salmon mode.
         self._salmon_watchdog: Optional[threading.Timer] = None
+        # Debounce Timer: super is a single modifier so brief accidental
+        # taps (reaching for keyboard shortcuts, jostling the key) would
+        # otherwise kick off a voice session. Hold for ≥SALMON_DEBOUNCE
+        # ms before _on_salmon_press_actual fires. Released before the
+        # timer expires → discard as a misfire. The 500ms prebuffer
+        # captures audio across the debounce window so nothing is lost.
+        self._salmon_debounce_timer: Optional[threading.Timer] = None
 
     def _build_voice(self) -> VoiceController:
         d = self._cfg["doubao"]
@@ -475,7 +482,31 @@ class SpitchDaemon:
     # here rather than leaving the mic open and Doubao streaming.
     _SALMON_RECORDING_WATCHDOG_S = 60.0
 
+    # How long super must be held before we treat it as an intentional
+    # voice-session start. Brief taps (reaching for other shortcuts,
+    # accidental keypress while typing) are filtered out. The audio
+    # pipeline's 500 ms prebuffer captures the entire debounce window,
+    # so a press that survives the wait does NOT lose the first
+    # ~200 ms of speech — voice.press() at T+200ms still pulls in the
+    # T-300..T+200ms slice of microphone history.
+    _SALMON_DEBOUNCE_MS = 200
+
     def _on_salmon_press(self) -> None:
+        # Defer the real press by SALMON_DEBOUNCE_MS to filter brief
+        # accidental taps. If _on_salmon_release fires inside the
+        # window we cancel the timer and discard the event silently.
+        # Holding past the threshold runs _on_salmon_press_actual,
+        # which is what the press path used to do directly.
+        self._cancel_salmon_debounce()
+        self._salmon_debounce_timer = threading.Timer(
+            self._SALMON_DEBOUNCE_MS / 1000.0,
+            self._on_salmon_press_actual,
+        )
+        self._salmon_debounce_timer.daemon = True
+        self._salmon_debounce_timer.start()
+
+    def _on_salmon_press_actual(self) -> None:
+        self._salmon_debounce_timer = None
         if self._voice is None:
             return
         if self._linger_timer is not None:
@@ -500,6 +531,17 @@ class SpitchDaemon:
         self._salmon_watchdog.start()
 
     def _on_salmon_release(self) -> None:
+        # Debounce: super released before the timer fired → discard as
+        # an accidental tap. No session ever started, no event was
+        # emitted, no audio was sent to ASR. Nothing to clean up
+        # beyond cancelling the pending timer.
+        if self._salmon_debounce_timer is not None:
+            log.info(
+                "salmon press debounced (held <%dms, ignored)",
+                self._SALMON_DEBOUNCE_MS,
+            )
+            self._cancel_salmon_debounce()
+            return
         if self._voice is None:
             return
         log.info(
@@ -531,6 +573,13 @@ class SpitchDaemon:
         # {session_start, partial*, final?, session_end} sequence.
 
     def _on_salmon_cancel(self) -> None:
+        # Cancel any pending debounce too — if a non-modifier key was
+        # pressed during the debounce window, treat the whole chord as
+        # cancelled and don't start the session.
+        if self._salmon_debounce_timer is not None:
+            log.info("salmon cancelled during debounce window")
+            self._cancel_salmon_debounce()
+            return
         if self._voice is None:
             return
         if self._active_source != "salmon":
@@ -551,6 +600,16 @@ class SpitchDaemon:
         except Exception:
             pass
         self._salmon_watchdog = None
+
+    def _cancel_salmon_debounce(self) -> None:
+        t = getattr(self, "_salmon_debounce_timer", None)
+        if t is None:
+            return
+        try:
+            t.cancel()
+        except Exception:
+            pass
+        self._salmon_debounce_timer = None
 
     def _salmon_watchdog_fire(self) -> None:
         if self._active_source != "salmon" or self._voice is None:
