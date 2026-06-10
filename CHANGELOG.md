@@ -2,6 +2,15 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 风格，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] — 2026-06-10
+
+salmon 模式新增 `tap` 事件。
+
+短按 Super（< 200ms debounce 窗口内松开）原先被静默丢弃，现在向
+cmdsock 订阅者发布 `{"evt": "tap", "source": "salmon"}`。Salmon
+overlay 用它触发"框选截图 → 按住 Super 说话"流程。带其他键的组合
+（Super+Tab 等）仍走 cancel 路径，不会误发 tap。
+
 ## [0.5.5] — 2026-05-08
 
 修复"短录音 / 急促松手时丢后半截"。

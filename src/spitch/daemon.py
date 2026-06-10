@@ -531,16 +531,22 @@ class SpitchDaemon:
         self._salmon_watchdog.start()
 
     def _on_salmon_release(self) -> None:
-        # Debounce: super released before the timer fired → discard as
-        # an accidental tap. No session ever started, no event was
-        # emitted, no audio was sent to ASR. Nothing to clean up
-        # beyond cancelling the pending timer.
+        # Debounce: super released before the timer fired → no voice
+        # session ever started, no audio was sent to ASR. v0.7: instead
+        # of discarding silently, publish a `tap` event so subscribers
+        # can bind a deliberate short Super press (e.g. the Salmon
+        # overlay's region-screenshot mode). Chords are still filtered:
+        # a third key during the window goes through _on_salmon_cancel,
+        # which clears the timer before this release path runs.
         if self._salmon_debounce_timer is not None:
             log.info(
-                "salmon press debounced (held <%dms, ignored)",
+                "salmon tap (held <%dms) → publish tap event",
                 self._SALMON_DEBOUNCE_MS,
             )
             self._cancel_salmon_debounce()
+            self._bus.publish({
+                "evt": "tap", "source": "salmon", "ts": time.time(),
+            })
             return
         if self._voice is None:
             return
